@@ -1,0 +1,24 @@
+{
+  "completion_rate": 80.0,
+  "last_checkin_date": "2026-04-22",
+  "last_checkin_message_id": "om_x100b51b3be2404a4b3df9698d42533f",
+  "listening_progress": "Cam10 Test1 Section3",
+  "reading_progress": "Cam10 Test2 Section2",
+  "last_mode_message_id": "om_x100b51b3b778d0e0b29fac06953d765",
+  "last_mode_selected": "3",
+  "last_mode_date": "2026-04-22",
+  "state": "🟢 正常",
+  "fail_streak": 0,
+  "streak": 1,
+  "recovery_mode": false,
+  "last_writing_message_id": "om_x100b51b8d9a558a0b4ca8cb00470439",
+  "last_writing_date": "2026-04-22",
+  "last_writing_scores": {
+    "TR": 6.5,
+    "CC": 6.0,
+    "LR": 6.5,
+    "GRA": 5.5
+  },
+  "last_manual_writing_message_id": "om_x100b51b809762ca8b3cca6861b82908",
+  "last_auto_writing_message_id": "om_x100b51b8d9a558a0b4ca8cb00470439"
+}
