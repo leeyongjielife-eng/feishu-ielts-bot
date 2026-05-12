@@ -51,20 +51,35 @@ PY
   fi
 fi
 
+if [[ ! -f "$LARK_CLI" ]]; then
+  ielts_daily_log "ERROR: lark-cli not found at ${LARK_CLI}"
+  exit 127
+fi
+
+if [[ "$need_init" -eq 1 ]]; then
+  if python3 "$ROOT/bin/init_placement_test.py" try-send "$STATE_FILE" >>"$LOG_FILE" 2>&1; then
+    ielts_daily_log "placement mock test (6 messages) sent; awaiting #我的成绩"
+    exit 0
+  fi
+fi
+
+if [[ "$need_init" -eq 0 && -f "$STATE_FILE" ]]; then
+  if python3 "$ROOT/bin/message-router.py" daily-missed-checkin >>"$LOG_FILE" 2>&1; then
+    :
+  else
+    ielts_daily_log "WARN: daily-missed-checkin exit=$?"
+  fi
+fi
+
 MESSAGE="$(python3 "$ROOT/bin/render_daily_push_message.py" "$STATE_FILE" "$need_init")"
 if [[ "$need_init" -eq 1 ]]; then
-  IDEMPOTENCY_KEY="ielts-init-questionnaire-${DAY_KEY}"
-  ielts_daily_log "initial_scores missing -> send initialization questionnaire first"
+  IDEMPOTENCY_KEY="ielts-init-reminder-${DAY_KEY}"
+  ielts_daily_log "initial_scores missing -> send init reminder (mock test already sent or pending)"
 else
   IDEMPOTENCY_KEY="ielts-daily-modes-${DAY_KEY}"
 fi
 
 ielts_daily_log "start chat_id=${CHAT_ID} idempotency_key=${IDEMPOTENCY_KEY} lark_cli=${LARK_CLI}"
-
-if [[ ! -f "$LARK_CLI" ]]; then
-  ielts_daily_log "ERROR: lark-cli not found at ${LARK_CLI}"
-  exit 127
-fi
 
 dry_run_flag=()
 if [[ "${DRY_RUN:-0}" == "1" ]]; then

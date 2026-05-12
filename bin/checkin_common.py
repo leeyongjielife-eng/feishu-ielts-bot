@@ -335,7 +335,11 @@ def is_structured_checkin_content(content: str) -> bool:
 
 
 def classify_checkin_message(content: str) -> str:
-    """structured | legacy | hint | none"""
+    """structured | legacy | hint | none
+
+    legacy 仅用于识别旧版单行「打卡 x/y」；路由层不会对其调用 apply_checkin_to_state，
+    故不写入 checkin_history。累计打卡日数仅以 structured 写入的历史为准。
+    """
     if parse_structured_checkin(content):
         return "structured"
     c = (content or "").strip()

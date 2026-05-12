@@ -8,7 +8,7 @@ import subprocess
 import sys
 import time
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -192,6 +192,124 @@ def ensure_defaults(state: Dict) -> None:
         state["prev_week_writing_avg"] = {}
     if "last_checkin_motivation_image" not in state:
         state["last_checkin_motivation_image"] = ""
+    if "missed_days" not in state:
+        state["missed_days"] = 0
+    if "missed_checkin_record_dates" not in state or not isinstance(state.get("missed_checkin_record_dates"), list):
+        state["missed_checkin_record_dates"] = []
+    if "last_missed_checkin_processed_for" not in state:
+        state["last_missed_checkin_processed_for"] = ""
+
+
+def _initialized_for_daily(state: Dict) -> bool:
+    scores = state.get("initial_scores")
+    return isinstance(scores, dict) and {"L", "R", "W", "S"}.issubset(scores.keys())
+
+
+def _local_today_yesterday() -> Tuple[date, date, str]:
+    today = datetime.now().astimezone().date()
+    yesterday = today - timedelta(days=1)
+    return today, yesterday, yesterday.strftime("%Y-%m-%d")
+
+
+def _yesterday_in_plan_window(state: Dict, yesterday: date) -> bool:
+    sd = state.get("start_date")
+    if not sd:
+        return False
+    try:
+        s0 = datetime.strptime(str(sd)[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return False
+    return yesterday >= s0
+
+
+def _had_checkin_on_date(state: Dict, day: date) -> bool:
+    ds = day.strftime("%Y-%m-%d")
+    hist = state.get("checkin_history")
+    if isinstance(hist, list):
+        for row in hist:
+            if isinstance(row, dict) and str(row.get("date", ""))[:10] == ds:
+                return True
+    lcd = str(state.get("last_checkin_date") or "")[:10]
+    return len(lcd) == 10 and lcd == ds
+
+
+def _missed_checkin_month_count(state: Dict, ystr: str) -> int:
+    prefix = ystr[:7]
+    dates = state.get("missed_checkin_record_dates")
+    if not isinstance(dates, list):
+        return 1
+    return sum(1 for d in dates if str(d)[:7] == prefix) + 1
+
+
+def format_missed_checkin_notice(yesterday: date, month_count: int, fail_streak: int) -> str:
+    zh = f"{yesterday.month}月{yesterday.day}日"
+    return (
+        "📋 昨日未打卡记录\n"
+        f"昨天（{zh}）未检测到打卡记录\n"
+        f"已记录为漏打卡（本月第{month_count}次）\n"
+        f"连续未完成：{fail_streak}天\n"
+        "\n"
+        "没关系，今天重新开始 💪\n"
+        "今日任务即将推送..."
+    )
+
+
+def run_daily_missed_checkin() -> int:
+    """由 send-daily-modes.sh 在 08:30 推送前调用：若计划已开始且昨天无打卡，则累计并提醒。"""
+    with state_lock():
+        state = load_state()
+        ensure_defaults(state)
+        if not _initialized_for_daily(state):
+            log("INFO: daily-missed-checkin skip (not initialized)")
+            return 0
+
+        _, yesterday, ystr = _local_today_yesterday()
+        processed = str(state.get("last_missed_checkin_processed_for") or "")
+        if processed == ystr:
+            log(f"INFO: daily-missed-checkin skip (already processed {ystr})")
+            return 0
+
+        if not _yesterday_in_plan_window(state, yesterday):
+            log("INFO: daily-missed-checkin skip (yesterday before start_date or no start_date)")
+            return 0
+
+        if _had_checkin_on_date(state, yesterday):
+            log(f"INFO: daily-missed-checkin skip (checkin present on {ystr})")
+            return 0
+
+        month_count = _missed_checkin_month_count(state, ystr)
+        missed_days = int(state.get("missed_days", 0) or 0) + 1
+        fail_streak = int(state.get("fail_streak", 0) or 0) + 1
+        recovery_mode = fail_streak >= 2
+
+        dates = state.get("missed_checkin_record_dates")
+        if not isinstance(dates, list):
+            dates = []
+        else:
+            dates = list(dates)
+        dates.append(ystr)
+
+        state["missed_days"] = missed_days
+        state["fail_streak"] = fail_streak
+        state["recovery_mode"] = recovery_mode
+        state["missed_checkin_record_dates"] = dates
+        state["last_missed_checkin_processed_for"] = ystr
+        if recovery_mode:
+            state["state"] = "🔴 差"
+
+        write_state(state)
+        notice = format_missed_checkin_notice(yesterday, month_count, fail_streak)
+
+    log(
+        f"INFO: daily-missed-checkin recorded ystr={ystr} missed_days={missed_days} "
+        f"fail_streak={fail_streak} recovery_mode={recovery_mode}"
+    )
+    try:
+        send_message(notice)
+    except Exception as exc:
+        log(f"ERROR: daily-missed-checkin send failed: {exc}")
+        return 1
+    return 0
 
 
 def parse_progress(raw: str) -> Tuple[int, int, int]:
@@ -430,6 +548,7 @@ def handle_init_reset(state: Dict, message: Dict) -> Tuple[Dict, str]:
         "xp_daily_threshold": "",
         "study_plan_sent": False,
         "last_checkin_motivation_image": "",
+        "mock_test_sent": False,
     }
     return updates, f"已重置初始化信息。\n\n{INIT_PROMPT}"
 
@@ -725,4 +844,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "daily-missed-checkin":
+        sys.exit(run_daily_missed_checkin())
     sys.exit(main())

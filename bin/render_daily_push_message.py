@@ -1,20 +1,32 @@
 #!/usr/bin/env python3
-"""为 send-daily-modes.sh 生成完整推送正文（stdout）。参数: STATE_FILE need_init(0|1)"""
+"""为 send-daily-modes.sh 生成完整推送正文（stdout）。参数: STATE_FILE need_init(0|1)
+
+已初始化时，「Day x / N」与总进度条与 mode_tasks.completed_checkin_days_in_plan 同口径：
+计划窗口内、结构化打卡写入 checkin_history 的不重复日期数（legacy 不计入）。
+"""
 from __future__ import annotations
 
 import json
 import sys
-from datetime import date, datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "bin"))
+from mode_tasks import completed_checkin_days_in_plan  # noqa: E402
 from progress_bar import make_bar  # noqa: E402
 
 INIT_MESSAGE = """【IELTS 监督助手】初始化问卷
 
 请输入你最近一次雅思模考成绩（没有则估分）：
 格式：#我的成绩 L:x.x R:x.x W:x.x S:x.x 目标:6.5 天数:60"""
+
+INIT_REMINDER_AFTER_MOCK = """【IELTS 监督助手】
+
+模拟测试材料已推送。请完成阅读/写作/口语自评（听力请用 Cambridge 真题），对照最后一条消息中的阅读答案后，回复：
+
+#我的成绩 L:x.x R:x.x W:x.x S:x.x 目标:6.5 天数:60
+
+（将分数、目标分、备考天数改为你的真实值）"""
 
 MODE_BODY = """【IELTS 监督助手】今日任务模式（08:30）
 
@@ -42,7 +54,16 @@ def main() -> None:
     state_path = Path(sys.argv[1])
     need_init = sys.argv[2] == "1"
     if need_init:
-        print(INIT_MESSAGE, end="")
+        state: dict = {}
+        if state_path.exists():
+            try:
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+            except Exception:
+                state = {}
+        if state.get("mock_test_sent"):
+            print(INIT_REMINDER_AFTER_MOCK, end="")
+        else:
+            print(INIT_MESSAGE, end="")
         return
 
     state: dict = {}
@@ -56,21 +77,10 @@ def main() -> None:
     if study_days < 1:
         study_days = 60
 
-    start_date = state.get("start_date")
-    today = date.today()
-    if start_date:
-        try:
-            s0 = datetime.strptime(str(start_date)[:10], "%Y-%m-%d").date()
-            elapsed = (today - s0).days + 1
-        except ValueError:
-            elapsed = 1
-    else:
-        elapsed = 1
-
-    day_num = max(1, min(elapsed, study_days))
-    pct = round(day_num / study_days * 100)
-    bar = make_bar(float(pct), 100.0)
-    header = f"📚 今日任务（Day {day_num}/{study_days}）\n总进度：{bar}  {pct}%\n────────────────\n\n"
+    comp = completed_checkin_days_in_plan(state)
+    pct = round(min(100.0, float(comp) / float(study_days) * 100.0)) if study_days else 0
+    bar = make_bar(float(comp), float(study_days))
+    header = f"📚 今日任务（Day {comp}/{study_days}）\n总进度：{bar}  {pct}%\n────────────────\n\n"
     print(header + MODE_BODY, end="")
 
 
