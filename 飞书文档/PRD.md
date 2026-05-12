@@ -44,8 +44,9 @@
 ### 3.1 每日 08:30 任务推送（launchd）
 
 - **入口脚本**：`bin/send-daily-modes.sh`
-- **逻辑**：若 `user_state.json` 中缺少完整 `initial_scores`（L/R/W/S 四项），则推送 **初始化问卷**；否则由 `bin/render_daily_push_message.py` 生成 **含 Day x/N 总进度条** 的「1/2/3 模式」说明并发送。
-- **幂等**：通过 `lark-cli` 的 `--idempotency-key` 按日区分（初始化问卷 vs 日常模式）。
+- **未初始化**（`user_state.json` 无完整 `initial_scores`）：**首次**由 `bin/init_placement_test.py` 经本脚本 **连发 6 条**雅思学术模拟卷与答案（消息间隔约 2 秒，单条幂等键按日分片），成功后写入 `mock_test_sent: true`；之后同日及后续若仍未初始化，则发送 **短提醒**（`render_daily_push_message.py` 在 `mock_test_sent` 为真时的文案），幂等键 `ielts-init-reminder-YYYY-MM-DD`。
+- **已初始化**：先可选执行 `bin/message-router.py daily-missed-checkin`（昨日未打卡则累计并提醒）；再由 `bin/render_daily_push_message.py` 生成 **含 Day x/N 总进度条** 的「1/2/3 模式」说明并发送（Day/进度与 `mode_tasks.completed_checkin_days_in_plan` 同口径）。
+- **幂等**：通过 `lark-cli` 的 `--idempotency-key` 按日区分（模拟卷各段、初始化提醒、日常模式）。
 - **部署说明**：仓库内提供周报用 `launchd` 示例 plist；**每日 08:30** 的 plist 通常置于本机 `~/Library/LaunchAgents/`（详见 `README.md`），由用户自行配置 `ProgramArguments` 指向 `send-daily-modes.sh`。
 
 ### 3.2 三种学习模式（标准 / 减负 / 极简）
@@ -62,14 +63,14 @@
 ### 3.4 60 天阶段化任务（3 阶段）
 
 - **计划长度**：`study_days` 由初始化 `#我的成绩 … 天数:N` 写入，默认 60，范围 1–365。
-- **阶段划分**（`mode_tasks.compute_day_phase`）：在计划窗口内按 **已累计结构化打卡的不重复天数** 驱动阶段（无打卡记录时回退为日历备考日）；**第 1–20 天 → 阶段一；21–40 → 阶段二；41+ → 阶段三**（与「总天数均分三阶段」的文案型计划可并存，代码以打卡日阈值为准）。
+- **阶段划分**（`mode_tasks.compute_day_phase`）：在计划窗口内按 **已累计结构化打卡的不重复天数**（即 `checkin_history` 中落在窗口内的不重复 `date`；仅 structured 打卡会写入该历史）驱动阶段；无打卡记录时回退为 **日历备考日**；**第 1–20 天 → 阶段一；21–40 → 阶段二；41+ → 阶段三**（与「总天数均分三阶段」的文案型计划可并存，代码以打卡日阈值为准）。
 - **阶段标题**：基础巩固 / 专项突破 / 冲刺模拟。
 - **差异化**：词汇量基线、写作是否排篇、阶段三模考周提示、弱项加练行等随阶段与 `weakest_skill` 变化；**Recovery Mode** 下任务减半（见 3.7）。
 
 ### 3.5 打卡系统
 
 - **主路径（推荐）**：**结构化打卡** — 固定多行模板：`打卡` + `听力/阅读/写作/词汇` 四行；听力完成须含 **正确率%** 与 **错题数**；阅读完成须含 **错题数** 与 **用时**；写作/词汇用「完成/未完成」等标记。解析与回复见 `bin/checkin_common.py`。
-- **兼容路径**：`打卡 x/y` 单行 **legacy** 格式（`classify_checkin_message`）；无法解析且以「打卡」开头时返回 **hint** 与格式说明。
+- **兼容路径**：`打卡 x/y` 单行 **legacy** 格式（`classify_checkin_message`）；**不写入** `checkin_history`，仅回复格式说明并记录 `last_checkin_message_id`。无法解析且以「打卡」开头时返回 **hint** 与格式说明。
 - **处理入口**：`bin/message-router.py`（轮询历史消息）；`bin/parse-checkin.py` 为可选「仅处理会话最新一条」的补充路径。
 - **反馈内容**：分项进度条（听力正确率、阅读等效正确率）、**综合完成率** 进度条、连续天数条、状态灯、规则化 **点评** 列表；触发 Recovery 时附提示。
 
@@ -94,7 +95,7 @@
 - **触发**：未完成初始化时 08:30 问卷；或用户发送 `#我的成绩 L:x.x R:x.x W:x.x S:x.x 目标:x.x 天数:N`（分数为 0–9，步长 0.5）。
 - **输出 1**：`init_plan.format_score_analysis_message` — 各科条形图、均分与目标差距、最弱项、预计达标日期范围。
 - **输出 2**：`init_plan.generate_study_roadmap_text` — 优先 **Gemini 生成** 个性化路线图，失败则 **规则模板** `format_study_roadmap_fallback`（按 `study_days` 三等分阶段叙述，含 Cam10→Cam18 教材顺序说明）。
-- **重置**：`#重新初始化` 清空初始化相关字段及 `last_checkin_motivation_image` 等（见代码 `handle_init_reset`）。
+- **重置**：`#重新初始化` 清空初始化相关字段、`mock_test_sent`、`last_checkin_motivation_image` 等（见代码 `handle_init_reset`）。
 
 ### 3.10 每日打卡完成后的随机配图
 
