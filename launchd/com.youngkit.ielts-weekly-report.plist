@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>FEISHU_IELTS_CHAT_ID</key>
+		<string>oc_99000aba52da6814c200481c4dedf1ea</string>
+		<key>HOME</key>
+		<string>/Users/youngkit</string>
+		<key>LOGNAME</key>
+		<string>youngkit</string>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+		<key>USER</key>
+		<string>youngkit</string>
+	</dict>
+	<key>Label</key>
+	<string>com.youngkit.ielts-weekly-report</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/youngkit/Projects/ielts-lark-daily-push/bin/weekly-report.py</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StandardErrorPath</key>
+	<string>/Users/youngkit/Projects/ielts-lark-daily-push/logs/weekly-report-launchd.err</string>
+	<key>StandardOutPath</key>
+	<string>/Users/youngkit/Projects/ielts-lark-daily-push/logs/weekly-report-launchd.out</string>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Weekday</key>
+		<integer>0</integer>
+		<key>Hour</key>
+		<integer>21</integer>
+		<key>Minute</key>
+		<integer>0</integer>
+	</dict>
+	<key>WorkingDirectory</key>
+	<string>/Users/youngkit/Projects/ielts-lark-daily-push</string>
+</dict>
+</plist>

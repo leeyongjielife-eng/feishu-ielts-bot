@@ -10,6 +10,10 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent.parent
+BIN_DIR = Path(__file__).resolve().parent
+if str(BIN_DIR) not in sys.path:
+    sys.path.insert(0, str(BIN_DIR))
+from mode_tasks import build_mode_tasks  # noqa: E402
 LOG_DIR = ROOT / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = Path(os.environ.get("LOG_FILE", str(LOG_DIR / "mode-selection.log")))
@@ -30,7 +34,6 @@ DEFAULT_PROGRESS = "Cam10 Test1 Section1"
 MAX_BOOK = 18
 MAX_TEST_PER_BOOK = 4
 MAX_SECTION = 4
-TASK2_PLACEHOLDER = "Task 2 占位题目：Some people think that online learning will replace traditional classroom learning. Discuss both views and give your own opinion."
 
 
 def log(message: str) -> None:
@@ -127,48 +130,6 @@ def advance_progress(current: str) -> str:
     return format_progress((MAX_BOOK, MAX_TEST_PER_BOOK, MAX_SECTION))
 
 
-def build_tasks(mode: str, listening_progress: str, reading_progress: str, recovery_mode: bool) -> Dict:
-    if not recovery_mode:
-        header = f"已收到模式选择：{mode}\n今日任务如下："
-        if mode == "1":
-            body = (
-                f"- 听力：{listening_progress}\n"
-                f"- 阅读：{reading_progress}\n"
-                f"- 写作：{TASK2_PLACEHOLDER}\n"
-                "- 词汇：30个"
-            )
-            return {"message": f"{header}\n{body}", "advance_listening": True, "advance_reading": True}
-        if mode == "2":
-            body = (
-                f"- 听力：{listening_progress}\n"
-                f"- 阅读：{reading_progress}\n"
-                "- 词汇：30个"
-            )
-            return {"message": f"{header}\n{body}", "advance_listening": True, "advance_reading": True}
-        body = (
-            f"- 阅读：{reading_progress}\n"
-            "- 词汇：30个"
-        )
-        return {"message": f"{header}\n{body}", "advance_listening": False, "advance_reading": True}
-
-    # Recovery Mode：明日任务减半（一次性生效）
-    header = f"已收到模式选择：{mode}\n⚠️ Recovery Mode 生效（明日任务减半）\n今日任务如下："
-    if mode == "1":
-        body = (
-            f"- 阅读：{reading_progress}\n"
-            "- 词汇：15个"
-        )
-        return {"message": f"{header}\n{body}", "advance_listening": False, "advance_reading": True}
-    if mode == "2":
-        body = (
-            f"- 阅读：{reading_progress}\n"
-            "- 词汇：15个"
-        )
-        return {"message": f"{header}\n{body}", "advance_listening": False, "advance_reading": True}
-    body = "- 词汇：15个"
-    return {"message": f"{header}\n{body}", "advance_listening": False, "advance_reading": False}
-
-
 def get_latest_mode_message(messages: list) -> Optional[Tuple[str, str]]:
     for message in messages:
         if message.get("msg_type") != "text":
@@ -224,7 +185,7 @@ def main() -> int:
     listening_progress = state["listening_progress"]
     reading_progress = state["reading_progress"]
     recovery_mode = bool(state.get("recovery_mode", False))
-    task_plan = build_tasks(mode, listening_progress, reading_progress, recovery_mode)
+    task_plan = build_mode_tasks(mode, listening_progress, reading_progress, recovery_mode, state)
     task_message = task_plan["message"]
 
     try:

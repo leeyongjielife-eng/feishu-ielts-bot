@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -9,6 +8,20 @@ from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+BIN_DIR = Path(__file__).resolve().parent
+if str(BIN_DIR) not in sys.path:
+    sys.path.insert(0, str(BIN_DIR))
+from checkin_common import (  # noqa: E402
+    CHECKIN_FORMAT_HINT,
+    apply_checkin_to_state,
+    classify_checkin_message,
+    composite_completion_rate,
+    evaluate_state,
+    format_structured_checkin_reply,
+    parse_structured_checkin,
+)
+from checkin_motivation_image import try_send_checkin_motivation  # noqa: E402
+
 LOG_DIR = ROOT / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = Path(os.environ.get("LOG_FILE", str(LOG_DIR / "checkin.log")))
@@ -23,7 +36,6 @@ os.environ["USER"] = os.environ.get("USER", Path(os.environ["HOME"]).name)
 os.environ["LOGNAME"] = os.environ.get("LOGNAME", os.environ["USER"])
 
 LARK_CLI = os.environ.get("LARK_CLI") or shutil.which("lark-cli") or "/opt/homebrew/bin/lark-cli"
-CHECKIN_RE = re.compile(r"^\s*打卡\s*[:：]?\s*(\d+)\s*/\s*(\d+)\s*$")
 
 
 def log(message: str) -> None:
@@ -74,38 +86,6 @@ def send_feedback_message(text: str) -> None:
         )
 
 
-def format_percent(value: float) -> str:
-    if float(value).is_integer():
-        return f"{int(value)}%"
-    return f"{value:.2f}%"
-
-
-def evaluate_state(completion_rate: float, current_fail_streak: int, current_streak: int) -> dict:
-    fail_streak = current_fail_streak + 1 if completion_rate < 50 else 0
-    streak = current_streak + 1 if completion_rate >= 80 else 0
-
-    if completion_rate < 50 or fail_streak >= 2:
-        return {
-            "state": "🔴 差",
-            "fail_streak": fail_streak,
-            "streak": streak,
-            "recovery_mode": fail_streak >= 2,
-        }
-    if completion_rate >= 80:
-        return {
-            "state": "🟢 正常",
-            "fail_streak": fail_streak,
-            "streak": streak,
-            "recovery_mode": False,
-        }
-    return {
-        "state": "🟡 不稳定",
-        "fail_streak": fail_streak,
-        "streak": streak,
-        "recovery_mode": False,
-    }
-
-
 def load_state() -> dict:
     if not STATE_FILE.exists():
         return {}
@@ -122,6 +102,33 @@ def atomic_write_state(state: dict) -> None:
         json.dump(state, f, ensure_ascii=False, indent=2)
         f.write("\n")
     tmp_file.replace(STATE_FILE)
+
+
+def ensure_defaults(state: dict) -> None:
+    if "fail_streak" not in state:
+        state["fail_streak"] = 0
+    if "streak" not in state:
+        state["streak"] = 0
+    if "recovery_mode" not in state:
+        state["recovery_mode"] = False
+    if "listening_accuracy_history" not in state:
+        state["listening_accuracy_history"] = []
+    if "reading_error_history" not in state:
+        state["reading_error_history"] = []
+    if "weekly_listening_avg" not in state:
+        state["weekly_listening_avg"] = 0.0
+    if "weekly_reading_avg" not in state:
+        state["weekly_reading_avg"] = 0.0
+    if "weekly_writing_avg" not in state:
+        state["weekly_writing_avg"] = {}
+    if "prev_week_listening_avg" not in state:
+        state["prev_week_listening_avg"] = None
+    if "prev_week_reading_errors_avg" not in state:
+        state["prev_week_reading_errors_avg"] = None
+    if "prev_week_writing_avg" not in state:
+        state["prev_week_writing_avg"] = {}
+    if "last_checkin_motivation_image" not in state:
+        state["last_checkin_motivation_image"] = ""
 
 
 def main() -> int:
@@ -148,6 +155,7 @@ def main() -> int:
     content = (latest.get("content") or "").strip()
 
     state = load_state()
+    ensure_defaults(state)
     if state.get("last_checkin_message_id") == message_id:
         log(f"NOOP: already processed message_id={message_id}")
         return 0
@@ -156,40 +164,32 @@ def main() -> int:
         log(f"NOOP: latest msg_type={msg_type}, not text")
         return 0
 
-    match = CHECKIN_RE.match(content)
-    if not match:
-        log(f"NOOP: latest text not checkin format content={content}")
+    kind = classify_checkin_message(content)
+    if kind == "none":
+        log(f"NOOP: latest text not checkin content={content[:80]!r}")
         return 0
 
-    done = int(match.group(1))
-    total = int(match.group(2))
-    if total <= 0 or done < 0 or done > total:
-        log(f"NOOP: invalid checkin ratio done={done} total={total}")
-        return 0
-
-    completion_rate = round(done * 100 / total, 2)
-    last_checkin_date = datetime.now().strftime("%Y-%m-%d")
-    current_fail_streak = int(state.get("fail_streak", 0) or 0)
-    current_streak = int(state.get("streak", 0) or 0)
-    evaluated = evaluate_state(completion_rate, current_fail_streak, current_streak)
-
-    state["completion_rate"] = completion_rate
-    state["last_checkin_date"] = last_checkin_date
-    state["last_checkin_message_id"] = message_id
-    state["state"] = evaluated["state"]
-    state["fail_streak"] = evaluated["fail_streak"]
-    state["streak"] = evaluated["streak"]
-    state["recovery_mode"] = evaluated["recovery_mode"]
-
-    atomic_write_state(state)
-    feedback_message = (
-        f"📊 今日状态：{evaluated['state']}\n"
-        f"完成率：{format_percent(completion_rate)}\n"
-        f"打卡项数：{done}/{total}\n"
-        f"连续完成：{evaluated['streak']}天"
-    )
-    if evaluated["recovery_mode"]:
-        feedback_message += "\n⚠️ Recovery Mode 已触发：明日任务减半。"
+    if kind == "structured":
+        parsed = parse_structured_checkin(content)
+        assert parsed is not None
+        completion_rate = composite_completion_rate(parsed)
+        evaluated = evaluate_state(completion_rate, int(state.get("fail_streak", 0) or 0), int(state.get("streak", 0) or 0))
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        updates = apply_checkin_to_state(state, parsed, evaluated, completion_rate, today_str, message_id)
+        state.update(updates)
+        atomic_write_state(state)
+        feedback_message = format_structured_checkin_reply(parsed, state, evaluated, completion_rate)
+    elif kind == "legacy":
+        state["last_checkin_message_id"] = message_id
+        atomic_write_state(state)
+        feedback_message = CHECKIN_FORMAT_HINT
+    else:
+        state["last_checkin_message_id"] = message_id
+        atomic_write_state(state)
+        feedback_message = (
+            CHECKIN_FORMAT_HINT
+            + "\n\n（当前内容无法解析，请检查四项是否齐全、换行，以及听力/阅读完成时的正确率与错题数。）"
+        )
 
     try:
         send_feedback_message(feedback_message)
@@ -197,12 +197,18 @@ def main() -> int:
         log(f"ERROR: send feedback failed: {exc}")
         return 1
 
-    log(
-        "OK: parsed checkin "
-        f"done={done} total={total} completion_rate={completion_rate} "
-        f"last_checkin_date={last_checkin_date} message_id={message_id} "
-        f"state={evaluated['state']} fail_streak={evaluated['fail_streak']} streak={evaluated['streak']}"
-    )
+    if kind == "structured":
+        sent = try_send_checkin_motivation(state, CHAT_ID, LARK_CLI, log)
+        if sent:
+            fresh = load_state()
+            ensure_defaults(fresh)
+            if fresh.get("last_checkin_message_id") == message_id:
+                fresh["last_checkin_motivation_image"] = sent
+                atomic_write_state(fresh)
+            else:
+                log("motivation state write skip: last_checkin_message_id drifted")
+
+    log(f"OK: checkin kind={kind} message_id={message_id}")
     return 0
 
 

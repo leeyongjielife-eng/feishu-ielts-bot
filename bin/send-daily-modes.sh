@@ -26,40 +26,7 @@ fi
 
 CHAT_ID="${FEISHU_IELTS_CHAT_ID:-oc_99000aba52da6814c200481c4dedf1ea}"
 DAY_KEY="$(date '+%Y-%m-%d')"
-IDEMPOTENCY_KEY="ielts-daily-modes-${DAY_KEY}"
 STATE_FILE="${STATE_FILE:-$ROOT/user_state.json}"
-
-INIT_MESSAGE=$(cat <<'MSG'
-【IELTS 监督助手】初始化问卷
-
-请输入你最近一次雅思模考成绩（没有则估分）：
-格式：#我的成绩 L:x.x R:x.x W:x.x S:x.x 目标:6.5 天数:60
-MSG
-)
-
-MESSAGE=$(cat <<'MSG'
-【IELTS 监督助手】今日任务模式（08:30）
-
-请在群内回复 1 / 2 / 3 选择今日模式：
-
-【1】标准模式
-- 建议时长：5–7 小时
-- 核心内容：听读写全套练习 + 词汇 + 复盘
-- XP 权重：1.0
-
-【2】忙碌模式
-- 建议时长：2–4 小时
-- 核心内容：1 套听力 + 1 套阅读 + 词汇
-- XP 权重：0.7
-
-【3】极简模式
-- 建议时长：约 1 小时
-- 核心内容：1 篇阅读 + 词汇（维持手感）
-- XP 权重：0.4
-
-说明：本阶段为定时固定模板推送；选择结果请自行执行与记录，Bot 暂不自动归档。
-MSG
-)
 
 need_init=1
 if [[ -f "$STATE_FILE" ]]; then
@@ -84,10 +51,12 @@ PY
   fi
 fi
 
+MESSAGE="$(python3 "$ROOT/bin/render_daily_push_message.py" "$STATE_FILE" "$need_init")"
 if [[ "$need_init" -eq 1 ]]; then
-  MESSAGE="$INIT_MESSAGE"
   IDEMPOTENCY_KEY="ielts-init-questionnaire-${DAY_KEY}"
   ielts_daily_log "initial_scores missing -> send initialization questionnaire first"
+else
+  IDEMPOTENCY_KEY="ielts-daily-modes-${DAY_KEY}"
 fi
 
 ielts_daily_log "start chat_id=${CHAT_ID} idempotency_key=${IDEMPOTENCY_KEY} lark_cli=${LARK_CLI}"

@@ -6,14 +6,32 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from ai_caller import call_ai_with_fallback
+from checkin_common import (
+    CHECKIN_FORMAT_HINT,
+    apply_checkin_to_state,
+    classify_checkin_message,
+    composite_completion_rate,
+    evaluate_state,
+    format_structured_checkin_reply,
+    parse_structured_checkin,
+)
+from checkin_motivation_image import try_send_checkin_motivation
+from init_plan import format_score_analysis_message, generate_study_roadmap_text
+from mode_tasks import build_mode_tasks
+from progress_bar import make_bar
 
 ROOT = Path(__file__).resolve().parent.parent
+BIN_DIR = Path(__file__).resolve().parent
+if str(BIN_DIR) not in sys.path:
+    sys.path.insert(0, str(BIN_DIR))
+
 LOG_DIR = ROOT / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = Path(os.environ.get("LOG_FILE", str(LOG_DIR / "message-router.log")))
@@ -36,25 +54,20 @@ INIT_SCORES_RE = re.compile(
     r"^\s*#我的成绩\s+L\s*:\s*([0-9](?:\.[05])?)\s+R\s*:\s*([0-9](?:\.[05])?)\s+W\s*:\s*([0-9](?:\.[05])?)\s+S\s*:\s*([0-9](?:\.[05])?)\s+目标\s*:\s*([0-9](?:\.[05])?)\s+天数\s*:\s*(\d{1,3})\s*$",
     re.IGNORECASE,
 )
-CHECKIN_RE = re.compile(r"^\s*打卡\s*[:：]?\s*(\d+)\s*/\s*(\d+)\s*$")
-MODE_RE = re.compile(r"^\s*([123])\s*$")
 PROGRESS_RE = re.compile(r"^Cam(\d+)\s+Test(\d+)\s+Section(\d+)$")
+MODE_RE = re.compile(r"^\s*([123])\s*$")
 
 DEFAULT_PROGRESS = "Cam10 Test1 Section1"
 MAX_BOOK = 18
 MAX_TEST_PER_BOOK = 4
 MAX_SECTION = 4
-TASK2_PLACEHOLDER = (
-    "Task 2 占位题目：Some people think that online learning will replace traditional classroom learning. "
-    "Discuss both views and give your own opinion."
-)
 WRITING_UNAVAILABLE_MESSAGE = (
     "⚠️ AI批改暂时不可用。请将你的作文粘贴到任意AI，附上评分标准：\n"
     "按雅思四维评分：TR(任务回应)/CC(连贯衔接)/LR(词汇丰富度)/GRA(语法准确性)，每项0-9分，输出评分+3条改进建议。\n"
     "完成后请回复 #批改结果 + 评分内容"
 )
 MANUAL_FORMAT_HINT = (
-    "格式不正确，请使用以下模板：\n"
+    "格式不正确，请使用以下模板（分数行可不带进度条）：\n"
     "#批改结果\n"
     "TR: x.x\n"
     "CC: x.x\n"
@@ -159,6 +172,26 @@ def ensure_defaults(state: Dict) -> None:
         state["streak"] = 0
     if "recovery_mode" not in state:
         state["recovery_mode"] = False
+    if "listening_accuracy_history" not in state:
+        state["listening_accuracy_history"] = []
+    if "reading_error_history" not in state:
+        state["reading_error_history"] = []
+    if "weekly_listening_avg" not in state:
+        state["weekly_listening_avg"] = 0.0
+    if "weekly_reading_avg" not in state:
+        state["weekly_reading_avg"] = 0.0
+    if "weekly_writing_avg" not in state:
+        state["weekly_writing_avg"] = {}
+    if "study_plan_sent" not in state:
+        state["study_plan_sent"] = False
+    if "prev_week_listening_avg" not in state:
+        state["prev_week_listening_avg"] = None
+    if "prev_week_reading_errors_avg" not in state:
+        state["prev_week_reading_errors_avg"] = None
+    if "prev_week_writing_avg" not in state:
+        state["prev_week_writing_avg"] = {}
+    if "last_checkin_motivation_image" not in state:
+        state["last_checkin_motivation_image"] = ""
 
 
 def parse_progress(raw: str) -> Tuple[int, int, int]:
@@ -187,22 +220,6 @@ def advance_progress(current: str) -> str:
     if book < MAX_BOOK:
         return format_progress((book + 1, 1, 1))
     return format_progress((MAX_BOOK, MAX_TEST_PER_BOOK, MAX_SECTION))
-
-
-def format_percent(value: float) -> str:
-    if float(value).is_integer():
-        return f"{int(value)}%"
-    return f"{value:.2f}%"
-
-
-def evaluate_state(completion_rate: float, current_fail_streak: int, current_streak: int) -> Dict:
-    fail_streak = current_fail_streak + 1 if completion_rate < 50 else 0
-    streak = current_streak + 1 if completion_rate >= 80 else 0
-    if completion_rate < 50 or fail_streak >= 2:
-        return {"state": "🔴 差", "fail_streak": fail_streak, "streak": streak, "recovery_mode": fail_streak >= 2}
-    if completion_rate >= 80:
-        return {"state": "🟢 正常", "fail_streak": fail_streak, "streak": streak, "recovery_mode": False}
-    return {"state": "🟡 不稳定", "fail_streak": fail_streak, "streak": streak, "recovery_mode": False}
 
 
 def build_placement_plan(scores: Dict[str, float], target_score: float, study_days: int) -> Dict:
@@ -256,25 +273,6 @@ def build_placement_plan(scores: Dict[str, float], target_score: float, study_da
     }
 
 
-def format_placement_plan(plan: Dict, scores: Dict[str, float], target_score: float, study_days: int) -> str:
-    weakest_map = {"L": "听力", "R": "阅读", "W": "写作", "S": "口语"}
-    return (
-        "🎯 个性化学习计划（Placement Test）\n"
-        f"当前分数：L {scores['L']} / R {scores['R']} / W {scores['W']} / S {scores['S']}\n"
-        f"当前均分：{plan['avg']}，薄弱项：{weakest_map[plan['weakest_skill']]}（1.5x时长）\n"
-        f"目标分数：{target_score}，备考天数：{study_days} 天\n\n"
-        f"每日建议学习时长：{plan['daily_hours']} 小时\n"
-        f"Cambridge 倒推进度：约 {plan['books_needed']} 册，总计约 {plan['books_per_day']} 册/天（{plan['books_per_week']} 册/周）\n\n"
-        "每周专项目标：\n"
-        f"- 听力：{plan['weekly_targets']['L']}（约 {plan['weekly_hours']['L']} 小时）\n"
-        f"- 阅读：{plan['weekly_targets']['R']}（约 {plan['weekly_hours']['R']} 小时）\n"
-        f"- 写作：{plan['weekly_targets']['W']}（约 {plan['weekly_hours']['W']} 小时）\n"
-        f"- 口语：{plan['weekly_targets']['S']}（约 {plan['weekly_hours']['S']} 小时）\n\n"
-        f"初始强度系数 InitialLevelFactor：{plan['level_factor']}\n"
-        f"每日XP门槛：{plan['xp_threshold']}"
-    )
-
-
 def extract_writing_body(content: str) -> str:
     cleaned = re.sub(r"^\s*#写作提交\b", "", content, count=1, flags=re.IGNORECASE).strip()
     return cleaned
@@ -326,15 +324,18 @@ def normalize_review_json(data: Dict) -> Dict:
 def format_writing_feedback(review: Dict) -> str:
     scores = review["scores"]
     improvements = review["improvements"]
+    tr, cc, lr, gra = scores["TR"], scores["CC"], scores["LR"], scores["GRA"]
     return (
-        "#批改结果\n"
-        f"TR: {scores['TR']}\n"
-        f"CC: {scores['CC']}\n"
-        f"LR: {scores['LR']}\n"
-        f"GRA: {scores['GRA']}\n"
-        f"建议1: {improvements[0]}\n"
-        f"建议2: {improvements[1]}\n"
-        f"建议3: {improvements[2]}"
+        "📝 写作批改结果\n"
+        f"TR:  {make_bar(tr, 9.0)}  {tr}\n"
+        f"CC:  {make_bar(cc, 9.0)}  {cc}\n"
+        f"LR:  {make_bar(lr, 9.0)}  {lr}\n"
+        f"GRA: {make_bar(gra, 9.0)}  {gra}\n"
+        "────────────────\n"
+        "改进建议：\n"
+        f"1) {improvements[0]}\n"
+        f"2) {improvements[1]}\n"
+        f"3) {improvements[2]}"
     )
 
 
@@ -345,7 +346,11 @@ def parse_manual_review(content: str) -> Optional[Dict]:
 
     score_matches = dict(
         (k.upper(), v)
-        for k, v in re.findall(r"^\s*(TR|CC|LR|GRA)\s*[:：]\s*([0-9](?:\.\d+)?)\s*$", text, flags=re.IGNORECASE | re.MULTILINE)
+        for k, v in re.findall(
+            r"^\s*(TR|CC|LR|GRA)\s*[:：]\s*(?:[█░]+\s+)?([0-9](?:\.\d+)?)\s*$",
+            text,
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
     )
     if set(score_matches.keys()) != {"TR", "CC", "LR", "GRA"}:
         return None
@@ -369,35 +374,6 @@ def parse_manual_review(content: str) -> Optional[Dict]:
         return None
 
     return {"scores": scores, "improvements": suggestions}
-
-
-def build_mode_tasks(mode: str, listening_progress: str, reading_progress: str, recovery_mode: bool) -> Dict:
-    if not recovery_mode:
-        header = f"已收到模式选择：{mode}\n今日任务如下："
-        if mode == "1":
-            body = (
-                f"- 听力：{listening_progress}\n"
-                f"- 阅读：{reading_progress}\n"
-                f"- 写作：{TASK2_PLACEHOLDER}\n"
-                "- 词汇：30个"
-            )
-            return {"message": f"{header}\n{body}", "advance_listening": True, "advance_reading": True}
-        if mode == "2":
-            body = (
-                f"- 听力：{listening_progress}\n"
-                f"- 阅读：{reading_progress}\n"
-                "- 词汇：30个"
-            )
-            return {"message": f"{header}\n{body}", "advance_listening": True, "advance_reading": True}
-        body = f"- 阅读：{reading_progress}\n- 词汇：30个"
-        return {"message": f"{header}\n{body}", "advance_listening": False, "advance_reading": True}
-
-    header = f"已收到模式选择：{mode}\n⚠️ Recovery Mode 生效（明日任务减半）\n今日任务如下："
-    if mode in ("1", "2"):
-        body = f"- 阅读：{reading_progress}\n- 词汇：15个"
-        return {"message": f"{header}\n{body}", "advance_listening": False, "advance_reading": True}
-    body = "- 词汇：15个"
-    return {"message": f"{header}\n{body}", "advance_listening": False, "advance_reading": False}
 
 
 def get_latest_match(messages: List[Dict], matcher) -> Optional[Dict]:
@@ -430,7 +406,7 @@ def pick_route(messages: List[Dict], state: Dict) -> Optional[Tuple[str, Dict]]:
     if latest_manual_review and last_manual_writing_id != latest_manual_review.get("message_id"):
         return "manual_writing", latest_manual_review
 
-    latest_checkin = get_latest_match(messages, lambda c: bool(CHECKIN_RE.match(c)))
+    latest_checkin = get_latest_match(messages, lambda c: classify_checkin_message(c) != "none")
     if latest_checkin and state.get("last_checkin_message_id") != latest_checkin.get("message_id"):
         return "checkin", latest_checkin
 
@@ -452,11 +428,13 @@ def handle_init_reset(state: Dict, message: Dict) -> Tuple[Dict, str]:
         "start_date": "",
         "initial_level_factor": "",
         "xp_daily_threshold": "",
+        "study_plan_sent": False,
+        "last_checkin_motivation_image": "",
     }
     return updates, f"已重置初始化信息。\n\n{INIT_PROMPT}"
 
 
-def handle_init_scores(state: Dict, message: Dict) -> Tuple[Dict, str]:
+def handle_init_scores(state: Dict, message: Dict) -> Tuple[Dict, Union[str, List[str]]]:
     content = (message.get("content") or "").strip()
     match = INIT_SCORES_RE.match(content)
     if not match:
@@ -477,17 +455,25 @@ def handle_init_scores(state: Dict, message: Dict) -> Tuple[Dict, str]:
         return {"last_init_scores_message_id": message.get("message_id", "")}, "分数请填写 0-9 之间（可用 .0/.5）。"
 
     plan = build_placement_plan(scores, target_score, study_days)
+    start_date_str = datetime.now().strftime("%Y-%m-%d")
+    listen_p = str(state.get("listening_progress") or DEFAULT_PROGRESS)
+    msg1 = format_score_analysis_message(plan, scores, target_score, study_days, start_date_str)
+    roadmap, roadmap_src = generate_study_roadmap_text(
+        plan, scores, target_score, study_days, start_date_str, listen_p
+    )
+    log(f"INFO: init study roadmap source={roadmap_src} message_id={message.get('message_id', '')}")
     updates = {
         "last_init_scores_message_id": message.get("message_id", ""),
         "initial_scores": scores,
         "weakest_skill": plan["weakest_skill"],
         "target_score": target_score,
         "study_days": study_days,
-        "start_date": datetime.now().strftime("%Y-%m-%d"),
+        "start_date": start_date_str,
         "initial_level_factor": plan["level_factor"],
         "xp_daily_threshold": plan["xp_threshold"],
+        "study_plan_sent": True,
     }
-    return updates, format_placement_plan(plan, scores, target_score, study_days)
+    return updates, [msg1, roadmap]
 
 
 def handle_writing_submission(state: Dict, message: Dict) -> Tuple[Dict, str]:
@@ -496,6 +482,8 @@ def handle_writing_submission(state: Dict, message: Dict) -> Tuple[Dict, str]:
     provider_used = "none"
     fallback_triggered = False
     latency_ms = 0
+    normalized: Optional[Dict] = None
+    reply = ""
     if not body:
         reply = "📝 已收到写作提交请求，但正文为空。请使用“#写作提交 + 正文内容”重新发送。"
     else:
@@ -555,12 +543,15 @@ def handle_writing_submission(state: Dict, message: Dict) -> Tuple[Dict, str]:
         f"fallback_triggered={fallback_triggered} "
         f"latency_ms={latency_ms}"
     )
-    updates = {
+    scores_snap = dict(normalized["scores"]) if normalized and normalized.get("scores") else dict(state.get("last_writing_scores") or {})
+    updates: Dict[str, Any] = {
         "last_writing_message_id": message.get("message_id", ""),
         "last_auto_writing_message_id": message.get("message_id", ""),
         "last_writing_date": datetime.now().strftime("%Y-%m-%d"),
-        "last_writing_scores": normalized["scores"] if body and "normalized" in locals() else state.get("last_writing_scores", {}),
+        "last_writing_scores": scores_snap,
     }
+    if scores_snap:
+        updates["weekly_writing_avg"] = {k: round(float(v), 1) for k, v in scores_snap.items()}
     return updates, reply
 
 
@@ -578,41 +569,33 @@ def handle_manual_writing_result(state: Dict, message: Dict) -> Tuple[Dict, str]
         "last_manual_writing_message_id": message.get("message_id", ""),
         "last_writing_date": datetime.now().strftime("%Y-%m-%d"),
         "last_writing_scores": parsed["scores"],
+        "weekly_writing_avg": {k: round(float(v), 1) for k, v in parsed["scores"].items()},
     }
     return updates, format_writing_feedback(parsed)
 
 
 def handle_checkin(state: Dict, message: Dict) -> Tuple[Dict, str]:
     content = (message.get("content") or "").strip()
-    match = CHECKIN_RE.match(content)
-    if not match:
-        return {}, ""
+    kind = classify_checkin_message(content)
+    if kind == "structured":
+        parsed = parse_structured_checkin(content)
+        assert parsed is not None
+        completion_rate = composite_completion_rate(parsed)
+        evaluated = evaluate_state(completion_rate, int(state.get("fail_streak", 0) or 0), int(state.get("streak", 0) or 0))
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        updates = apply_checkin_to_state(state, parsed, evaluated, completion_rate, today_str, message.get("message_id", ""))
+        reply = format_structured_checkin_reply(parsed, state, evaluated, completion_rate)
+        return updates, reply
 
-    done = int(match.group(1))
-    total = int(match.group(2))
-    if total <= 0 or done < 0 or done > total:
-        return {}, "打卡格式有效但数值不合法，请使用如“打卡 3/4”。"
+    if kind == "legacy":
+        return {"last_checkin_message_id": message.get("message_id", "")}, CHECKIN_FORMAT_HINT
 
-    completion_rate = round(done * 100 / total, 2)
-    evaluated = evaluate_state(completion_rate, int(state.get("fail_streak", 0) or 0), int(state.get("streak", 0) or 0))
-    updates = {
-        "completion_rate": completion_rate,
-        "last_checkin_date": datetime.now().strftime("%Y-%m-%d"),
-        "last_checkin_message_id": message.get("message_id", ""),
-        "state": evaluated["state"],
-        "fail_streak": evaluated["fail_streak"],
-        "streak": evaluated["streak"],
-        "recovery_mode": evaluated["recovery_mode"],
-    }
-    reply = (
-        f"📊 今日状态：{evaluated['state']}\n"
-        f"完成率：{format_percent(completion_rate)}\n"
-        f"打卡项数：{done}/{total}\n"
-        f"连续完成：{evaluated['streak']}天"
-    )
-    if evaluated["recovery_mode"]:
-        reply += "\n⚠️ Recovery Mode 已触发：明日任务减半。"
-    return updates, reply
+    if kind == "hint":
+        return {
+            "last_checkin_message_id": message.get("message_id", ""),
+        }, CHECKIN_FORMAT_HINT + "\n\n（当前内容无法解析，请检查四项是否齐全、换行，以及听力/阅读完成时的正确率与错题数。）"
+
+    return {}, ""
 
 
 def handle_mode_selection(state: Dict, message: Dict) -> Tuple[Dict, str]:
@@ -621,7 +604,7 @@ def handle_mode_selection(state: Dict, message: Dict) -> Tuple[Dict, str]:
     reading_progress = state["reading_progress"]
     recovery_mode = bool(state.get("recovery_mode", False))
 
-    plan = build_mode_tasks(mode, listening_progress, reading_progress, recovery_mode)
+    plan = build_mode_tasks(mode, listening_progress, reading_progress, recovery_mode, state)
     updates = {
         "last_mode_message_id": message.get("message_id", ""),
         "last_mode_selected": mode,
@@ -677,12 +660,20 @@ def main() -> int:
     else:
         updates, reply = handle_mode_selection(state, message)
 
-    if not reply:
+    if isinstance(reply, list):
+        reply_parts = [p for p in reply if isinstance(p, str) and p.strip()]
+    else:
+        reply_parts = [reply] if isinstance(reply, str) and reply.strip() else []
+
+    if not reply_parts:
         log(f"NOOP: route={route_type} message_id={message_id} produced empty reply")
         return 0
 
     try:
-        send_message(reply)
+        for i, chunk in enumerate(reply_parts):
+            send_message(chunk)
+            if i < len(reply_parts) - 1:
+                time.sleep(0.45)
     except Exception as exc:
         log(f"ERROR: route={route_type} send failed message_id={message_id} err={exc}")
         return 1
@@ -716,6 +707,20 @@ def main() -> int:
         latest_state.update(updates)
         write_state(latest_state)
     log(f"OK: route={route_type} message_id={message_id}")
+
+    if route_type == "checkin" and classify_checkin_message((message.get("content") or "").strip()) == "structured":
+        merged = load_state()
+        ensure_defaults(merged)
+        sent = try_send_checkin_motivation(merged, CHAT_ID, LARK_CLI, log)
+        if sent:
+            with state_lock():
+                st = load_state()
+                ensure_defaults(st)
+                if st.get("last_checkin_message_id") != message_id:
+                    log("motivation state write skip: last_checkin_message_id drifted")
+                else:
+                    st["last_checkin_motivation_image"] = sent
+                    write_state(st)
     return 0
 
 

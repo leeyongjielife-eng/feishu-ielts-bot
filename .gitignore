@@ -5,3 +5,15 @@ user_state.json.lock
 
 # Runtime logs
 logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# macOS / editor
+.DS_Store
+
+# 打卡配图为本地素材，默认不入库（克隆后自建 pictures/）
+pictures/*
+!pictures/.gitkeep
