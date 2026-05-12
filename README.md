@@ -133,10 +133,6 @@ launchctl enable "gui/$(id -u)/com.youngkit.ielts-daily-push"
 
 开发与排障时可配合 Cursor / Claude 的 **Lark 系列 Skill**（例如 `lark-shared` 做登录与权限、`lark-im` 做收发消息说明），便于对照 OpenAPI 与 CLI 子命令。本仓库逻辑以 **`lark-cli` 命令行** 为准，不直接嵌入开放平台 HTTP 调用。
 
-### 作者与参赛信息
-
-- **作者**：youngkit  
-- **活动**：Mini Camp 第一期
 
 ---
 
@@ -179,6 +175,4 @@ Shell, launchd, Python 3, Lark CLI, JSON + `fcntl` + atomic writes, Google Gener
 
 Use community **lark-*** skills (e.g. `lark-shared`, `lark-im`) for auth and IM workflows; this repo executes **`lark-cli`**, not raw HTTP clients.
 
-### Author & program
 
-**youngkit** · **Mini Camp — Phase 1**
