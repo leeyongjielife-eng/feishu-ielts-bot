@@ -16,16 +16,28 @@ from ai_caller import call_ai_with_fallback
 from checkin_common import (
     CHECKIN_FORMAT_HINT,
     apply_checkin_to_state,
+    apply_daily_checkin_to_state,
     classify_checkin_message,
     composite_completion_rate,
+    composite_completion_rate_daily,
     evaluate_state,
+    format_daily_checkin_reply,
     format_structured_checkin_reply,
+    parse_daily_checkin,
     parse_structured_checkin,
+)
+from checkin_spec import (
+    NO_SPEC_PROMPT,
+    build_checkin_spec_payload,
+    checkin_spec_state_updates,
+    format_checkin_spec_message,
+    resolve_active_spec,
 )
 from checkin_motivation_image import try_send_checkin_motivation
 from init_plan import format_score_analysis_message, generate_study_roadmap_text
 from mode_tasks import build_mode_tasks
 from progress_bar import make_bar
+from task_progress import build_today_task_progress, progress_updates_after_checkin
 
 ROOT = Path(__file__).resolve().parent.parent
 BIN_DIR = Path(__file__).resolve().parent
@@ -55,12 +67,16 @@ INIT_SCORES_RE = re.compile(
     re.IGNORECASE,
 )
 PROGRESS_RE = re.compile(r"^Cam(\d+)\s+Test(\d+)\s+Section(\d+)$")
+READING_PROGRESS_RE = re.compile(r"^Cam(\d+)\s+Test(\d+)\s+Passage(\d+)$")
+LEGACY_READING_SECTION_RE = re.compile(r"^Cam(\d+)\s+Test(\d+)\s+Section(\d+)$")
 MODE_RE = re.compile(r"^\s*([123])\s*$")
 
 DEFAULT_PROGRESS = "Cam10 Test1 Section1"
+DEFAULT_READING_PROGRESS = "Cam10 Test1 Passage1"
 MAX_BOOK = 18
 MAX_TEST_PER_BOOK = 4
 MAX_SECTION = 4
+MAX_PASSAGE = 3
 WRITING_UNAVAILABLE_MESSAGE = (
     "⚠️ AI批改暂时不可用。请将你的作文粘贴到任意AI，附上评分标准：\n"
     "按雅思四维评分：TR(任务回应)/CC(连贯衔接)/LR(词汇丰富度)/GRA(语法准确性)，每项0-9分，输出评分+3条改进建议。\n"
@@ -161,11 +177,29 @@ def write_state(state: Dict) -> None:
     tmp_file.replace(STATE_FILE)
 
 
+def _migrate_reading_progress(value: str) -> str:
+    """旧版阅读使用 Section1..4；阅读改为 Passage1..3（Section4 截顶为 Passage3）。"""
+    if not value:
+        return DEFAULT_READING_PROGRESS
+    s = value.strip()
+    if READING_PROGRESS_RE.match(s):
+        return s
+    m = LEGACY_READING_SECTION_RE.match(s)
+    if not m:
+        return DEFAULT_READING_PROGRESS
+    book, test, section = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    passage = min(MAX_PASSAGE, max(1, section))
+    return f"Cam{book} Test{test} Passage{passage}"
+
+
 def ensure_defaults(state: Dict) -> None:
     if not state.get("listening_progress"):
         state["listening_progress"] = DEFAULT_PROGRESS
-    if not state.get("reading_progress"):
-        state["reading_progress"] = DEFAULT_PROGRESS
+    rp = state.get("reading_progress")
+    if not rp:
+        state["reading_progress"] = DEFAULT_READING_PROGRESS
+    elif not READING_PROGRESS_RE.match(str(rp).strip()):
+        state["reading_progress"] = _migrate_reading_progress(str(rp))
     if "fail_streak" not in state:
         state["fail_streak"] = 0
     if "streak" not in state:
@@ -198,6 +232,16 @@ def ensure_defaults(state: Dict) -> None:
         state["missed_checkin_record_dates"] = []
     if "last_missed_checkin_processed_for" not in state:
         state["last_missed_checkin_processed_for"] = ""
+    if "checkin_spec_date" not in state:
+        state["checkin_spec_date"] = ""
+    if "checkin_spec_mode" not in state:
+        state["checkin_spec_mode"] = ""
+    if "checkin_spec_recovery_mode" not in state:
+        state["checkin_spec_recovery_mode"] = False
+    if not isinstance(state.get("checkin_spec"), list):
+        state["checkin_spec"] = []
+    if not isinstance(state.get("today_task_progress"), dict):
+        state["today_task_progress"] = {}
 
 
 def _initialized_for_daily(state: Dict) -> bool:
@@ -313,6 +357,7 @@ def run_daily_missed_checkin() -> int:
 
 
 def parse_progress(raw: str) -> Tuple[int, int, int]:
+    """听力进度：Cam{book} Test{test} Section{1..4}。"""
     match = PROGRESS_RE.match(raw.strip())
     if not match:
         return parse_progress(DEFAULT_PROGRESS)
@@ -330,6 +375,7 @@ def format_progress(progress: Tuple[int, int, int]) -> str:
 
 
 def advance_progress(current: str) -> str:
+    """听力推进：每 Test 4 个 Section。"""
     book, test, section = parse_progress(current)
     if section < MAX_SECTION:
         return format_progress((book, test, section + 1))
@@ -338,6 +384,73 @@ def advance_progress(current: str) -> str:
     if book < MAX_BOOK:
         return format_progress((book + 1, 1, 1))
     return format_progress((MAX_BOOK, MAX_TEST_PER_BOOK, MAX_SECTION))
+
+
+def advance_listening_test(current: str) -> str:
+    """听力跳一整套 Test：模式 1/2 当日完成 4 个 Section 后到下个 Test 的 Section 1。"""
+    book, test, _section = parse_progress(current)
+    if test < MAX_TEST_PER_BOOK:
+        return format_progress((book, test + 1, 1))
+    if book < MAX_BOOK:
+        return format_progress((book + 1, 1, 1))
+    return format_progress((MAX_BOOK, MAX_TEST_PER_BOOK, MAX_SECTION))
+
+
+def parse_reading_progress(raw: str) -> Tuple[int, int, int]:
+    """阅读进度：Cam{book} Test{test} Passage{1..3}。"""
+    s = (raw or "").strip()
+    match = READING_PROGRESS_RE.match(s)
+    if not match:
+        migrated = _migrate_reading_progress(s)
+        match = READING_PROGRESS_RE.match(migrated)
+        if not match:
+            return 10, 1, 1
+    book = int(match.group(1))
+    test = int(match.group(2))
+    passage = int(match.group(3))
+    if book < 10 or book > MAX_BOOK or test < 1 or test > MAX_TEST_PER_BOOK or passage < 1 or passage > MAX_PASSAGE:
+        return parse_reading_progress(DEFAULT_READING_PROGRESS)
+    return book, test, passage
+
+
+def format_reading_progress(progress: Tuple[int, int, int]) -> str:
+    book, test, passage = progress
+    return f"Cam{book} Test{test} Passage{passage}"
+
+
+def advance_reading_progress(current: str) -> str:
+    """阅读推进：每 Test 3 个 Passage。"""
+    book, test, passage = parse_reading_progress(current)
+    if passage < MAX_PASSAGE:
+        return format_reading_progress((book, test, passage + 1))
+    if test < MAX_TEST_PER_BOOK:
+        return format_reading_progress((book, test + 1, 1))
+    if book < MAX_BOOK:
+        return format_reading_progress((book + 1, 1, 1))
+    return format_reading_progress((MAX_BOOK, MAX_TEST_PER_BOOK, MAX_PASSAGE))
+
+
+def advance_reading_test(current: str) -> str:
+    """阅读跳一整套 Test：模式 1/2 当日完成 3 个 Passage 后到下个 Test 的 Passage 1。"""
+    book, test, _passage = parse_reading_progress(current)
+    if test < MAX_TEST_PER_BOOK:
+        return format_reading_progress((book, test + 1, 1))
+    if book < MAX_BOOK:
+        return format_reading_progress((book + 1, 1, 1))
+    return format_reading_progress((MAX_BOOK, MAX_TEST_PER_BOOK, MAX_PASSAGE))
+
+
+def _progress_updates_after_checkin(state: Dict, today_str: str) -> Dict[str, Any]:
+    return progress_updates_after_checkin(
+        state,
+        today_str,
+        default_listen=DEFAULT_PROGRESS,
+        default_read=DEFAULT_READING_PROGRESS,
+        advance_listening_test=advance_listening_test,
+        advance_progress=advance_progress,
+        advance_reading_test=advance_reading_test,
+        advance_reading_progress=advance_reading_progress,
+    )
 
 
 def build_placement_plan(scores: Dict[str, float], target_score: float, study_days: int) -> Dict:
@@ -549,6 +662,10 @@ def handle_init_reset(state: Dict, message: Dict) -> Tuple[Dict, str]:
         "study_plan_sent": False,
         "last_checkin_motivation_image": "",
         "mock_test_sent": False,
+        "checkin_spec_date": "",
+        "checkin_spec_mode": "",
+        "checkin_spec_recovery_mode": False,
+        "checkin_spec": [],
     }
     return updates, f"已重置初始化信息。\n\n{INIT_PROMPT}"
 
@@ -696,46 +813,96 @@ def handle_manual_writing_result(state: Dict, message: Dict) -> Tuple[Dict, str]
 def handle_checkin(state: Dict, message: Dict) -> Tuple[Dict, str]:
     content = (message.get("content") or "").strip()
     kind = classify_checkin_message(content)
+    message_id = message.get("message_id", "")
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    if kind == "daily_attempt":
+        spec, _used_yesterday, prefix = resolve_active_spec(state)
+        if not spec:
+            return {}, NO_SPEC_PROMPT
+        parsed, ignored, missing = parse_daily_checkin(content, spec["items"])
+        if missing:
+            body = prefix + f"还缺：{'、'.join(missing)}\n\n" + format_checkin_spec_message(spec)
+            return {"last_checkin_message_id": message_id}, body
+        if not parsed:
+            body = prefix + format_checkin_spec_message(spec) + "\n\n（请按上方模板填写各项）"
+            return {"last_checkin_message_id": message_id}, body
+        completion_rate = composite_completion_rate_daily(parsed, spec["items"])
+        evaluated = evaluate_state(
+            completion_rate, int(state.get("fail_streak", 0) or 0), int(state.get("streak", 0) or 0)
+        )
+        updates = apply_daily_checkin_to_state(
+            state, parsed, spec["items"], spec, evaluated, completion_rate, today_str, message_id
+        )
+        updates.update(_progress_updates_after_checkin({**state, **updates}, today_str))
+        reply = format_daily_checkin_reply(
+            parsed,
+            spec["items"],
+            spec,
+            state,
+            evaluated,
+            completion_rate,
+            prefix=prefix,
+            ignored_labels=ignored or None,
+        )
+        return updates, reply
+
     if kind == "structured":
         parsed = parse_structured_checkin(content)
         assert parsed is not None
         completion_rate = composite_completion_rate(parsed)
         evaluated = evaluate_state(completion_rate, int(state.get("fail_streak", 0) or 0), int(state.get("streak", 0) or 0))
-        today_str = datetime.now().strftime("%Y-%m-%d")
-        updates = apply_checkin_to_state(state, parsed, evaluated, completion_rate, today_str, message.get("message_id", ""))
+        updates = apply_checkin_to_state(state, parsed, evaluated, completion_rate, today_str, message_id)
+        updates.update(_progress_updates_after_checkin({**state, **updates}, today_str))
         reply = format_structured_checkin_reply(parsed, state, evaluated, completion_rate)
         return updates, reply
 
     if kind == "legacy":
-        return {"last_checkin_message_id": message.get("message_id", "")}, CHECKIN_FORMAT_HINT
+        return {"last_checkin_message_id": message_id}, NO_SPEC_PROMPT
 
     if kind == "hint":
-        return {
-            "last_checkin_message_id": message.get("message_id", ""),
-        }, CHECKIN_FORMAT_HINT + "\n\n（当前内容无法解析，请检查四项是否齐全、换行，以及听力/阅读完成时的正确率与错题数。）"
+        spec, _, _prefix = resolve_active_spec(state)
+        if not spec:
+            return {"last_checkin_message_id": message_id}, NO_SPEC_PROMPT
+        body = format_checkin_spec_message(spec) + "\n\n（请按模板补全各行，首行 #今日打卡）"
+        return {"last_checkin_message_id": message_id}, body
 
     return {}, ""
 
 
-def handle_mode_selection(state: Dict, message: Dict) -> Tuple[Dict, str]:
+def handle_mode_selection(state: Dict, message: Dict) -> Tuple[Dict, Union[str, List[str]]]:
     mode = MODE_RE.match((message.get("content") or "").strip()).group(1)
     listening_progress = state["listening_progress"]
     reading_progress = state["reading_progress"]
     recovery_mode = bool(state.get("recovery_mode", False))
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    mode_changed = (
+        str(state.get("last_mode_date") or "") == today_str
+        and str(state.get("last_mode_selected") or "") != ""
+        and str(state.get("last_mode_selected") or "") != mode
+    )
 
     plan = build_mode_tasks(mode, listening_progress, reading_progress, recovery_mode, state)
+    spec_payload = build_checkin_spec_payload(
+        mode, listening_progress, reading_progress, recovery_mode, state, spec_date=today_str
+    )
     updates = {
         "last_mode_message_id": message.get("message_id", ""),
         "last_mode_selected": mode,
-        "last_mode_date": datetime.now().strftime("%Y-%m-%d"),
+        "last_mode_date": today_str,
     }
-    if plan["advance_listening"]:
-        updates["listening_progress"] = advance_progress(listening_progress)
-    if plan["advance_reading"]:
-        updates["reading_progress"] = advance_progress(reading_progress)
+    updates.update(checkin_spec_state_updates(spec_payload))
+    updates["today_task_progress"] = build_today_task_progress(
+        listening_progress,
+        reading_progress,
+        plan,
+        today_str,
+        state.get("today_task_progress"),
+    )
     if recovery_mode:
         updates["recovery_mode"] = False
-    return updates, plan["message"]
+    spec_msg = format_checkin_spec_message(spec_payload, mode_change_notice=mode_changed)
+    return updates, [plan["message"], spec_msg]
 
 
 def main() -> int:
@@ -827,7 +994,8 @@ def main() -> int:
         write_state(latest_state)
     log(f"OK: route={route_type} message_id={message_id}")
 
-    if route_type == "checkin" and classify_checkin_message((message.get("content") or "").strip()) == "structured":
+    checkin_kind = classify_checkin_message((message.get("content") or "").strip())
+    if route_type == "checkin" and checkin_kind in ("structured", "daily_attempt"):
         merged = load_state()
         ensure_defaults(merged)
         sent = try_send_checkin_motivation(merged, CHAT_ID, LARK_CLI, log)

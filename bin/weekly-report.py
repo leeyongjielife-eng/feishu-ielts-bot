@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parent.parent
 BIN_DIR = Path(__file__).resolve().parent
 if str(BIN_DIR) not in sys.path:
     sys.path.insert(0, str(BIN_DIR))
-from progress_bar import listen_progress_bar_line, make_bar  # noqa: E402
+from progress_bar import listen_progress_bar_line, make_bar, read_progress_bar_line  # noqa: E402
 
 LOG_DIR = ROOT / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -35,6 +35,7 @@ LARK_CLI = os.environ.get("LARK_CLI") or shutil.which("lark-cli") or "/opt/homeb
 
 SKILL_CN = {"L": "听力", "R": "阅读", "W": "写作", "S": "口语"}
 DEFAULT_PROGRESS = "Cam10 Test1 Section1"
+DEFAULT_READING_PROGRESS = "Cam10 Test1 Passage1"
 WD = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 
@@ -355,9 +356,9 @@ def format_report(state: Dict[str, Any], report_day: date) -> str:
     overall_bar = make_bar(overall, tgt) if overall > 0 else make_bar(0, tgt)
 
     listening = str(state.get("listening_progress") or DEFAULT_PROGRESS)
-    reading = str(state.get("reading_progress") or DEFAULT_PROGRESS)
+    reading = str(state.get("reading_progress") or DEFAULT_READING_PROGRESS)
     listen_bar = listen_progress_bar_line(listening)
-    read_bar = listen_progress_bar_line(reading)
+    read_bar = read_progress_bar_line(reading)
 
     focus = build_week_focus(state, re_avg, lw, weakest_type)
     weakest_skill = str(state.get("weakest_skill", "") or "").strip().upper() or "L"

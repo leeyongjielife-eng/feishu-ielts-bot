@@ -6,11 +6,33 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from typing import Dict, List, Tuple
 
+import re
+
 from progress_bar import listen_progress_bar_line
+
+LISTEN_RE = re.compile(r"^(Cam\d+\s+Test\d+)\s+Section\d+$")
+READ_RE = re.compile(r"^(Cam\d+\s+Test\d+)\s+Passage\d+$")
+
+
+def _listen_test_label(listening_progress: str) -> str:
+    """提取 'Cam10 Test1 Section?' → 'Cam10 Test1'，无匹配则原样返回。"""
+    m = LISTEN_RE.match((listening_progress or "").strip())
+    return m.group(1) if m else (listening_progress or "")
+
+
+def _read_test_label(reading_progress: str) -> str:
+    """提取 'Cam10 Test1 Passage?' → 'Cam10 Test1'，无匹配则原样返回。"""
+    m = READ_RE.match((reading_progress or "").strip())
+    return m.group(1) if m else (reading_progress or "")
 
 TASK2_PLACEHOLDER = (
     "Task 2 占位题目：Some people think that online learning will replace traditional classroom learning. "
     "Discuss both views and give your own opinion."
+)
+TASK1_PLACEHOLDER = (
+    "Task 1 占位题目：The chart below shows changes in the average household expenditure on selected categories "
+    "in a country between 2000 and 2020. Summarise the information by selecting and reporting the main features, "
+    "and make comparisons where relevant."
 )
 
 SKILL_CN = {"L": "听力", "R": "阅读", "W": "写作", "S": "口语"}
@@ -140,10 +162,19 @@ def _phase_header(state: Dict) -> str:
 
 
 def build_mode_tasks(mode: str, listening_progress: str, reading_progress: str, recovery_mode: bool, state: Dict) -> Dict:
+    """返回 {message, listening_advance, reading_advance}。
+    推进粒度：
+      - "test"：消耗一整套 Test（听力 4 个 Section / 阅读 3 个 Passage）。
+      - "step"：仅推进 1 个 Section / Passage。
+      - "none"：不推进。
+    """
     _done_days, _study_days, phase, _ptitle, schedule_day = compute_day_phase(state)
     weakest = str(state.get("weakest_skill", "") or "").strip().upper()
     vocab_n = _vocab_base(phase, recovery_mode)
     writing_today = _writing_due(phase, schedule_day)
+
+    listen_label = _listen_test_label(listening_progress)
+    read_label = _read_test_label(reading_progress)
 
     head = _phase_header(state)
     banner = listen_progress_bar_line(listening_progress)
@@ -156,10 +187,11 @@ def build_mode_tasks(mode: str, listening_progress: str, reading_progress: str, 
 
         if mode == "1":
             lines: List[str] = [
-                f"- 听力：{listening_progress}",
-                f"- 阅读：{reading_progress}",
+                f"- 听力：{listen_label}（全套 Section 1–4）",
+                f"- 阅读：{read_label}（全套 Passage 1–3）",
             ]
             if writing_today:
+                lines.append(f"- 写作：{TASK1_PLACEHOLDER}")
                 lines.append(f"- 写作：{TASK2_PLACEHOLDER}")
             else:
                 if phase == 1:
@@ -169,14 +201,18 @@ def build_mode_tasks(mode: str, listening_progress: str, reading_progress: str, 
                 else:
                     lines.append("- 写作：今日建议仍以审题提纲为主（若已写过正文可复盘改写）")
             lines.append(f"- 词汇：{vocab_n}个")
+            lines.append("- 复盘：错题精听 / 同义替换 / 病句改写，约 20–30 分钟")
             lines.extend(extras)
             if mock_line:
                 lines.append(mock_line)
             body = "\n".join(lines)
-            return {"message": f"{header}\n{body}", "advance_listening": True, "advance_reading": True}
+            return {"message": f"{header}\n{body}", "listening_advance": "test", "reading_advance": "test"}
 
         if mode == "2":
-            lines = [f"- 听力：{listening_progress}", f"- 阅读：{reading_progress}"]
+            lines = [
+                f"- 听力：{listen_label}（全套 Section 1–4）",
+                f"- 阅读：{read_label}（全套 Passage 1–3）",
+            ]
             if phase == 3:
                 lines.append(f"- 写作：{TASK2_PLACEHOLDER}")
             elif phase == 2 and writing_today:
@@ -186,8 +222,9 @@ def build_mode_tasks(mode: str, listening_progress: str, reading_progress: str, 
             if mock_line:
                 lines.append(mock_line)
             body = "\n".join(lines)
-            return {"message": f"{header}\n{body}", "advance_listening": True, "advance_reading": True}
+            return {"message": f"{header}\n{body}", "listening_advance": "test", "reading_advance": "test"}
 
+        # mode 3 极简：1 篇阅读 + 词汇
         lines = [f"- 阅读：{reading_progress}", f"- 词汇：{vocab_n}个"]
         if phase == 2 and weakest == "R":
             lines.append("- 弱项加练·阅读：加 1 篇错题类型专练（×1.5）")
@@ -196,7 +233,7 @@ def build_mode_tasks(mode: str, listening_progress: str, reading_progress: str, 
         if mock_line:
             lines.append(mock_line)
         body = "\n".join(lines)
-        return {"message": f"{header}\n{body}", "advance_listening": False, "advance_reading": True}
+        return {"message": f"{header}\n{body}", "listening_advance": "none", "reading_advance": "step"}
 
     # Recovery
     header = f"{top}已收到模式选择：{mode}\n⚠️ Recovery Mode 生效（明日任务减半）\n今日任务如下："
@@ -206,6 +243,6 @@ def build_mode_tasks(mode: str, listening_progress: str, reading_progress: str, 
         if phase == 2 and weakest == "R":
             lines.append("- 弱项加练·阅读：错题回顾 10 分钟（Recovery）")
         body = "\n".join(lines)
-        return {"message": f"{header}\n{body}", "advance_listening": False, "advance_reading": True}
+        return {"message": f"{header}\n{body}", "listening_advance": "none", "reading_advance": "step"}
     body = f"- 词汇：{rvocab}个"
-    return {"message": f"{header}\n{body}", "advance_listening": False, "advance_reading": False}
+    return {"message": f"{header}\n{body}", "listening_advance": "none", "reading_advance": "none"}

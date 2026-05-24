@@ -12,14 +12,18 @@ BIN_DIR = Path(__file__).resolve().parent
 if str(BIN_DIR) not in sys.path:
     sys.path.insert(0, str(BIN_DIR))
 from checkin_common import (  # noqa: E402
-    CHECKIN_FORMAT_HINT,
     apply_checkin_to_state,
+    apply_daily_checkin_to_state,
     classify_checkin_message,
     composite_completion_rate,
+    composite_completion_rate_daily,
     evaluate_state,
+    format_daily_checkin_reply,
     format_structured_checkin_reply,
+    parse_daily_checkin,
     parse_structured_checkin,
 )
+from checkin_spec import NO_SPEC_PROMPT, format_checkin_spec_message, resolve_active_spec  # noqa: E402
 from checkin_motivation_image import try_send_checkin_motivation  # noqa: E402
 
 LOG_DIR = ROOT / "logs"
@@ -169,26 +173,67 @@ def main() -> int:
         log(f"NOOP: latest text not checkin content={content[:80]!r}")
         return 0
 
-    if kind == "structured":
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    wrote_checkin = False
+    if kind == "daily_attempt":
+        spec, _used_yesterday, prefix = resolve_active_spec(state)
+        if not spec:
+            feedback_message = NO_SPEC_PROMPT
+            state["last_checkin_message_id"] = message_id
+            atomic_write_state(state)
+        else:
+            parsed, ignored, missing = parse_daily_checkin(content, spec["items"])
+            if missing or not parsed:
+                feedback_message = (
+                    prefix
+                    + (f"还缺：{'、'.join(missing)}\n\n" if missing else "")
+                    + format_checkin_spec_message(spec)
+                )
+                state["last_checkin_message_id"] = message_id
+                atomic_write_state(state)
+            else:
+                completion_rate = composite_completion_rate_daily(parsed, spec["items"])
+                evaluated = evaluate_state(
+                    completion_rate, int(state.get("fail_streak", 0) or 0), int(state.get("streak", 0) or 0)
+                )
+                updates = apply_daily_checkin_to_state(
+                    state, parsed, spec["items"], spec, evaluated, completion_rate, today_str, message_id
+                )
+                state.update(updates)
+                atomic_write_state(state)
+                wrote_checkin = True
+                feedback_message = format_daily_checkin_reply(
+                    parsed,
+                    spec["items"],
+                    spec,
+                    state,
+                    evaluated,
+                    completion_rate,
+                    prefix=prefix,
+                    ignored_labels=ignored or None,
+                )
+    elif kind == "structured":
         parsed = parse_structured_checkin(content)
         assert parsed is not None
         completion_rate = composite_completion_rate(parsed)
         evaluated = evaluate_state(completion_rate, int(state.get("fail_streak", 0) or 0), int(state.get("streak", 0) or 0))
-        today_str = datetime.now().strftime("%Y-%m-%d")
         updates = apply_checkin_to_state(state, parsed, evaluated, completion_rate, today_str, message_id)
         state.update(updates)
         atomic_write_state(state)
+        wrote_checkin = True
         feedback_message = format_structured_checkin_reply(parsed, state, evaluated, completion_rate)
     elif kind == "legacy":
         state["last_checkin_message_id"] = message_id
         atomic_write_state(state)
-        feedback_message = CHECKIN_FORMAT_HINT
+        feedback_message = NO_SPEC_PROMPT
     else:
+        spec, _, _ = resolve_active_spec(state)
         state["last_checkin_message_id"] = message_id
         atomic_write_state(state)
         feedback_message = (
-            CHECKIN_FORMAT_HINT
-            + "\n\n（当前内容无法解析，请检查四项是否齐全、换行，以及听力/阅读完成时的正确率与错题数。）"
+            format_checkin_spec_message(spec) + "\n\n（请按模板补全各行，首行 #今日打卡）"
+            if spec
+            else NO_SPEC_PROMPT
         )
 
     try:
@@ -197,7 +242,7 @@ def main() -> int:
         log(f"ERROR: send feedback failed: {exc}")
         return 1
 
-    if kind == "structured":
+    if wrote_checkin and state.get("last_checkin_date") == today_str:
         sent = try_send_checkin_motivation(state, CHAT_ID, LARK_CLI, log)
         if sent:
             fresh = load_state()

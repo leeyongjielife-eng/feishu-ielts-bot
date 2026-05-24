@@ -57,8 +57,10 @@
 
 ### 3.3 Cambridge 进度追踪（Cam10 → Cam18）
 
-- **进度串格式**：`Cam{10..18} Test{1..4} Section{1..4}`，由 `message-router` 中 `PROGRESS_RE` 校验；默认 `Cam10 Test1 Section1`。
-- **推进规则**：依模式在完成任务后 **推进听力与/或阅读** 进度（`advance_progress`，书本上限 18）；与当日任务文案中的「当前一套」对齐。
+- **进度串格式**：
+  - **听力**：`Cam{10..18} Test{1..4} Section{1..4}`，由 `message-router` 中 `PROGRESS_RE` 校验；默认 `Cam10 Test1 Section1`。
+  - **阅读**：`Cam{10..18} Test{1..4} Passage{1..3}`，由 `message-router` 中 `READING_PROGRESS_RE` 校验；默认 `Cam10 Test1 Passage1`。旧版 `Cam.. Section{1..4}` 字段会在 `ensure_defaults` 内自动迁移到 `Passage{1..3}`（`Section4` 截顶为 `Passage3`）。
+- **推进规则**：依模式在完成任务后 **推进听力与/或阅读** 进度；听力使用 `advance_progress`（每 Test 4 个 Section），阅读使用 `advance_reading_progress`（每 Test 3 个 Passage），书本上限 18；与当日任务文案中的「当前一套」对齐。
 
 ### 3.4 60 天阶段化任务（3 阶段）
 
@@ -126,9 +128,9 @@
 
 #### 3.10.4 媒体与图库规范
 
-- **图库路径**：仓库根目录下 **`pictures/`**；仅扫描 **直接子文件**（非递归子目录）；扩展名 **`.jpg` / `.jpeg` / `.png`**，**大小写不敏感**；忽略非图片文件。  
+- **图库路径**：仓库根目录下 `**pictures/`**；仅扫描 直接子文件（非递归子目录）；扩展名 `**.jpg` / `.jpeg` / `.png`**，**大小写不敏感**；忽略非图片文件。  
 - **目录或候选为空**：**静默跳过**（不打断打卡），不写 `last_checkin_motivation_image`。  
-- **与 `lark-cli` 的约束**：发图需使用 **相对仓库根** 的路径（如 `./pictures/xxx.png`），子进程 **`cwd`** 设为仓库根。
+- **与 `lark-cli` 的约束**：发图需使用 **相对仓库根** 的路径（如 `./pictures/xxx.png`），子进程 `**cwd`** 设为仓库根。
 
 #### 3.10.5 选图与「不与上一张重复」
 
@@ -142,8 +144,8 @@
 
 - **实现模块**：`bin/checkin_motivation_image.py`（枚举、`pick`、`try_send_checkin_motivation`）。  
 - **调用链**：`bin/message-router.py`（主路径）、`bin/parse-checkin.py`（仅最新一条消息的补充路径）在 **结构化打卡成功且反馈已发出** 后调用。  
-- **工作目录与路径**：发图使用 **相对仓库根** 路径（如 `./pictures/xxx.png`），子进程 **`cwd`** 为仓库根，以满足 `lark-cli` 校验。  
-- **飞书权限**：发图走 IM 资源上传，需开放平台为应用开通 **用户身份** 下相关权限，且本机执行 **`lark-cli auth login`** 携带对应 scope；否则配图失败（仍不反写 `last_checkin_motivation_image`）。
+- **工作目录与路径**：发图使用 **相对仓库根** 路径（如 `./pictures/xxx.png`），子进程 `**cwd`** 为仓库根，以满足 `lark-cli` 校验。  
+- **飞书权限**：发图走 IM 资源上传，需开放平台为应用开通 **用户身份** 下相关权限，且本机执行 `**lark-cli auth login`** 携带对应 scope；否则配图失败（仍不反写 `last_checkin_motivation_image`）。
 
 #### 3.10.7 与「每日任务推送」的关系（需求澄清）
 

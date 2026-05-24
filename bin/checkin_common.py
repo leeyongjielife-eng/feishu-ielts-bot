@@ -14,14 +14,11 @@ from progress_bar import make_bar
 READING_PCT_PER_ERROR = 5.4
 
 CHECKIN_FORMAT_HINT = (
-    "打卡请使用以下多行格式（可复制后改数字）：\n"
-    "打卡\n"
-    "听力：完成 正确率85% 错3题\n"
-    "阅读：完成 错5题 用时55分钟\n"
-    "写作：完成\n"
-    "词汇：完成\n"
-    "说明：听力/阅读「未完成」可写「未完成」；完成时请带正确率/错题/用时。"
+    "打卡请使用 #今日打卡 模板（选模式后会自动下发当日规格）。\n"
+    "若尚未选模式，请先回复 1 / 2 / 3。"
 )
+
+DAILY_LINE_RE = re.compile(r"^(听力|阅读|写作|词汇|复盘)\s*[:：]\s*(.+)$")
 
 
 def format_percent(value: float) -> str:
@@ -40,7 +37,12 @@ def evaluate_state(completion_rate: float, current_fail_streak: int, current_str
     return {"state": "🟡 不稳定", "fail_streak": fail_streak, "streak": streak, "recovery_mode": False}
 
 
-def reading_pct_from_errors(errors: int) -> float:
+def reading_pct_from_errors(errors: int, total_questions: Optional[int] = None) -> float:
+    """有题量时按 错题/总题数；否则用旧版错题→百分制映射。"""
+    if total_questions is not None and int(total_questions) > 0:
+        t = int(total_questions)
+        e = max(0, int(errors))
+        return float(max(0.0, min(100.0, round((1.0 - e / t) * 100.0, 1))))
     raw = 100.0 - READING_PCT_PER_ERROR * float(max(0, errors))
     return float(max(0.0, min(100.0, round(raw))))
 
@@ -270,7 +272,15 @@ def apply_checkin_to_state(
         "listening_errors": int(parsed["listen_errors"]) if parsed["listen_done"] and parsed["listen_errors"] is not None else None,
         "reading_errors": int(parsed["read_errors"]) if parsed["read_done"] and parsed["read_errors"] is not None else None,
         "reading_minutes": int(parsed["read_minutes"]) if parsed.get("read_minutes") is not None else None,
-        "reading_pct": reading_pct_from_errors(int(parsed["read_errors"])) if parsed["read_done"] and parsed["read_errors"] is not None else None,
+        "reading_questions": int(parsed["read_questions"]) if parsed.get("read_questions") is not None else None,
+        "reading_pct": (
+            reading_pct_from_errors(
+                int(parsed["read_errors"]),
+                int(parsed["read_questions"]) if parsed.get("read_questions") else None,
+            )
+            if parsed["read_done"] and parsed["read_errors"] is not None
+            else None
+        ),
         "writing_done": bool(parsed["write_done"]),
         "vocab_done": bool(parsed["vocab_done"]),
     }
@@ -334,17 +344,229 @@ def is_structured_checkin_content(content: str) -> bool:
     return parse_structured_checkin(content) is not None
 
 
-def classify_checkin_message(content: str) -> str:
-    """structured | legacy | hint | none
+def _parse_slot_body(body: str, item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    b = (body or "").strip()
+    done = _done_flag(b)
+    if done is None:
+        return None
+    err: int = int(item.get("default_errors") or 0)
+    vol: int = int(item.get("default_volume") or 0)
+    if not item.get("errors_na"):
+        em = re.search(r"错题\s*(\d+)", b)
+        if em:
+            err = int(em.group(1))
+            if err < 0:
+                return None
+    vm = re.search(r"题量\s*(\d+)", b)
+    if vm:
+        vol = int(vm.group(1))
+        if vol < 0:
+            return None
+    return {"done": done, "errors": err, "volume": vol}
 
-    legacy 仅用于识别旧版单行「打卡 x/y」；路由层不会对其调用 apply_checkin_to_state，
-    故不写入 checkin_history。累计打卡日数仅以 structured 写入的历史为准。
+
+def parse_daily_checkin(
+    content: str, spec_items: List[Dict[str, Any]]
+) -> Tuple[Optional[Dict[str, Any]], List[str], List[str]]:
     """
+    解析 #今日打卡。返回 (parsed_by_id, ignored_labels, missing_labels)。
+    parsed_by_id 键为 item id。
+    """
+    raw = (content or "").strip()
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    if not lines:
+        return None, [], [it["label"] for it in spec_items]
+    head = lines[0].replace("：", ":").rstrip(":").strip()
+    if head not in ("#今日打卡", "今日打卡"):
+        return None, [], [it["label"] for it in spec_items]
+
+    label_to_id = {str(it["label"]): str(it["id"]) for it in spec_items}
+    allowed = set(label_to_id.keys())
+    parsed: Dict[str, Any] = {}
+    ignored: List[str] = []
+
+    for ln in lines[1:]:
+        m = DAILY_LINE_RE.match(ln)
+        if not m:
+            continue
+        label, body = m.group(1), m.group(2)
+        if label not in allowed:
+            ignored.append(label)
+            continue
+        item_id = label_to_id[label]
+        item_spec = next(x for x in spec_items if x["id"] == item_id)
+        slot = _parse_slot_body(body, item_spec)
+        if slot is None:
+            return None, ignored, [it["label"] for it in spec_items if it["id"] not in parsed]
+        parsed[item_id] = slot
+
+    missing = [it["label"] for it in spec_items if it["id"] not in parsed]
+    if missing:
+        return None, ignored, missing
+
+    for it in spec_items:
+        if not it.get("volume_user_required"):
+            continue
+        slot = parsed.get(it["id"]) or {}
+        if slot.get("done") and int(slot.get("volume") or 0) <= 0:
+            return None, ignored, [f"{it['label']}（请填写本次实际题数）"]
+
+    return parsed, ignored, []
+
+
+def composite_completion_rate_daily(parsed: Dict[str, Any], spec_items: List[Dict[str, Any]]) -> float:
+    required = [it for it in spec_items if it.get("required", True)]
+    if not required:
+        return 0.0
+    done_n = sum(1 for it in required if parsed.get(it["id"], {}).get("done"))
+    return round(100.0 * float(done_n) / float(len(required)), 2)
+
+
+def _listen_accuracy_from_slot(slot: Dict[str, Any]) -> Optional[float]:
+    if not slot.get("done"):
+        return None
+    vol = int(slot.get("volume") or 0)
+    err = int(slot.get("errors") or 0)
+    if vol <= 0:
+        return 100.0
+    return float(max(0.0, min(100.0, round((1.0 - err / vol) * 100.0, 1))))
+
+
+def daily_parsed_to_legacy_shape(parsed: Dict[str, Any], spec_items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """转为与旧版字段兼容的 dict，供 apply_checkin_to_state / 点评复用。"""
+    listen = parsed.get("listening") or {}
+    read = parsed.get("reading") or {}
+    write = parsed.get("writing") or {}
+    vocab = parsed.get("vocab") or {}
+    return {
+        "listen_done": bool(listen.get("done")),
+        "listen_accuracy": _listen_accuracy_from_slot(listen) if listen else None,
+        "listen_errors": int(listen.get("errors") or 0) if listen.get("done") else None,
+        "read_done": bool(read.get("done")),
+        "read_errors": int(read.get("errors") or 0) if read.get("done") else None,
+        "read_questions": int(read.get("volume") or 0) if read.get("done") else None,
+        "read_minutes": None,
+        "write_done": bool(write.get("done")) if write else False,
+        "vocab_done": bool(vocab.get("done")) if vocab else False,
+        "review_done": bool((parsed.get("review") or {}).get("done")),
+        "review_minutes": int((parsed.get("review") or {}).get("volume") or 0),
+        "daily_items": parsed,
+        "spec_mode": None,
+    }
+
+
+def format_daily_checkin_reply(
+    parsed: Dict[str, Any],
+    spec_items: List[Dict[str, Any]],
+    spec_payload: Dict[str, Any],
+    state: Dict[str, Any],
+    evaluated: Dict[str, Any],
+    completion_rate: float,
+    *,
+    prefix: str = "",
+    ignored_labels: Optional[List[str]] = None,
+    defaulted_note: Optional[List[str]] = None,
+) -> str:
+    day_num, study_days = plan_day_num(state)
+    label_by_id = {it["id"]: it["label"] for it in spec_items}
+    lines: List[str] = []
+    if prefix:
+        lines.append(prefix.rstrip())
+        lines.append("")
+    lines.append(f"✅ 打卡收到 Day {day_num}/{study_days}")
+    if spec_payload.get("mode"):
+        lines.append(f"（规格：模式{spec_payload.get('mode')} · {spec_payload.get('date', '')}）")
+    lines.append("")
+    lines.append("今日表现：")
+
+    for it in spec_items:
+        iid = it["id"]
+        slot = parsed.get(iid) or {}
+        label = label_by_id.get(iid, iid)
+        if not slot.get("done"):
+            lines.append(f"{label}：⬜ 未完成")
+            continue
+        err = int(slot.get("errors") or 0)
+        vol = int(slot.get("volume") or 0)
+        unit = it.get("volume_unit", "")
+        if iid == "listening":
+            acc = _listen_accuracy_from_slot(slot)
+            if acc is not None:
+                lines.append(f"{label}：{make_bar(acc, 100.0)}  {format_percent(acc)}  (-{err}题 / 题量{vol})")
+            else:
+                lines.append(f"{label}：✅ 完成")
+        elif iid == "reading":
+            total_q = vol if vol > 0 else None
+            rp = reading_pct_from_errors(err, total_q)
+            q_note = f"/{vol}题" if vol > 0 else ""
+            lines.append(f"{label}：{make_bar(rp, 100.0)}  {format_percent(rp)}  (-{err}题{q_note})")
+        elif iid == "review":
+            lines.append(f"{label}：✅ 完成  {vol} 分钟")
+        else:
+            lines.append(f"{label}：✅ 完成  题量{vol}{unit}")
+
+    lines.append("")
+    lines.append(f"综合完成率：{make_bar(float(completion_rate), 100.0)}  {format_percent(completion_rate)}")
+    lines.append(f"连续天数：{make_bar(float(evaluated['streak']), 10.0)}  {evaluated['streak']}天")
+    lines.append(f"当前状态：{evaluated['state']}")
+    lines.append("")
+    lines.append("📌 点评：")
+    legacy = daily_parsed_to_legacy_shape(parsed, spec_items)
+    for b in build_checkin_commentary(legacy, state, evaluated):
+        lines.append(f"- {b}")
+    if ignored_labels:
+        lines.append("")
+        lines.append(f"（已忽略规格外项：{'、'.join(ignored_labels)}）")
+    if defaulted_note:
+        lines.append("")
+        for n in defaulted_note:
+            lines.append(f"· {n}")
+    if evaluated.get("recovery_mode"):
+        lines.append("")
+        lines.append("⚠️ Recovery Mode 已触发：明日任务减半。")
+    return "\n".join(lines)
+
+
+def apply_daily_checkin_to_state(
+    state: Dict[str, Any],
+    parsed: Dict[str, Any],
+    spec_items: List[Dict[str, Any]],
+    spec_payload: Dict[str, Any],
+    evaluated: Dict[str, Any],
+    completion_rate: float,
+    today_str: str,
+    message_id: str,
+) -> Dict[str, Any]:
+    legacy = daily_parsed_to_legacy_shape(parsed, spec_items)
+    legacy["spec_mode"] = spec_payload.get("mode")
+    updates = apply_checkin_to_state(state, legacy, evaluated, completion_rate, today_str, message_id)
+    history: List[Dict[str, Any]] = list(updates.get("checkin_history") or state.get("checkin_history") or [])
+    for row in reversed(history):
+        if str(row.get("date")) == today_str:
+            row["checkin_format"] = "daily"
+            row["mode_snapshot"] = spec_payload.get("mode")
+            row["spec_item_ids"] = [it["id"] for it in spec_items]
+            row["daily_items"] = parsed
+            break
+    updates["checkin_history"] = history
+    return updates
+
+
+def is_structured_checkin_content(content: str) -> bool:
+    return parse_structured_checkin(content) is not None
+
+
+def classify_checkin_message(content: str) -> str:
+    """daily_attempt | structured | legacy | hint | none"""
+    from checkin_spec import is_daily_checkin_attempt
+
+    if is_daily_checkin_attempt(content):
+        return "daily_attempt"
     if parse_structured_checkin(content):
         return "structured"
     c = (content or "").strip()
     if re.match(r"^\s*打卡\s*[:：]?\s*\d+\s*/\s*\d+\s*$", c):
         return "legacy"
-    if c.startswith("打卡"):
+    if c.startswith("打卡") or c.startswith("#今日打卡") or c.startswith("今日打卡"):
         return "hint"
     return "none"

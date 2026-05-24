@@ -1,0 +1,21 @@
+# 飞书IELTS Bot - Cursor规则
+
+## 项目架构
+- 主入口：bin/message-router.py（统一消息路由）
+- 定时推送：bin/send-daily-modes.sh（08:30 launchd触发）
+- 周报：bin/weekly-report.py（周日21:00触发）
+- 状态文件：user_state.json（所有用户状态）
+
+## 核心规则
+- 所有user_state.json读写必须用fcntl文件锁
+- 消息路由优先级：#写作提交 > #批改结果 > #我的成绩 > 打卡 > 1/2/3
+- 打卡：选模式后下发「今日打卡规格」；用户发 `#今日打卡`（字段随当日任务变化，见 bin/checkin_spec.py）
+- 进度格式：听力用Section1-4，阅读用Passage1-3
+- 消息发送用lark-cli im +messages-send --as user
+- chat_id: oc_99000aba52da6814c200481c4dedf1ea
+
+## 禁止事项
+- 不要随机跳跃进度顺序
+- 不要在对话里输出API keys
+- 不要新建LaunchAgent除非明确要求
+- 不要修改现有LaunchAgent除非明确要求

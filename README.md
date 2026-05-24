@@ -2,7 +2,7 @@
 
 基于 **飞书 CLI**（[larksuite/cli](https://github.com/larksuite/cli)）的本地自动化监督工具：定时推送、模式与阶段化任务编排、**结构化打卡**与状态、写作批改、初始化测评与学习计划、**周日周报**、**打卡后随机配图**。适合个人备考节奏管理与比赛/开源展示。
 
-**产品说明**：详细行为与数据结构见仓库内 [`飞书文档/PRD.md`](飞书文档/PRD.md)。
+**产品说明**：详细行为与数据结构见仓库内 `[飞书文档/PRD.md](飞书文档/PRD.md)`。
 
 ---
 
@@ -13,7 +13,7 @@
 解决什么问题：
 
 - **规律推送**：每日 **08:30** 提醒；未完成 `initial_scores` 时，**首次**由 `bin/init_placement_test.py` 经 `send-daily-modes.sh` 推送 **6 条**雅思学术模拟卷与答案（间隔 2 秒，写入 `mock_test_sent`），之后改为 **每日短提醒** 直至用户回复 `#我的成绩 …`；已初始化则推送 **1/2/3 模式**与 Day x/N 总进度。
-- **任务可执行**：根据所选模式（**标准 / 减负 / 极简**）、**Cambridge IELTS 10–18 式进度**（`Cam10 Test1 Section1` …）与 **三阶段 + Recovery Mode** 生成当日听/读/写/词汇任务（`bin/mode_tasks.py`）。
+- **任务可执行**：根据所选模式（**标准 / 减负 / 极简**）、**Cambridge IELTS 10–18 式进度**（听力 `Cam10 Test1 Section1`，阅读 `Cam10 Test1 Passage1`）与 **三阶段 + Recovery Mode** 生成当日听/读/写/词汇任务（`bin/mode_tasks.py`）。
 - **闭环反馈**：**推荐**使用 **结构化打卡**（多行：听力正确率+错题、阅读错题+用时、写作/词汇完成度）；兼容单行 `打卡 x/y`（legacy）。解析后输出综合完成率、进度条、状态（🟢 正常 / 🟡 不稳定 / 🔴 差）与 **Recovery Mode**（连续不佳时次日任务减半）。
 - **打卡后随机配图**：结构化打卡成功后，从仓库 `pictures/`（`.jpg`/`.jpeg`/`.png`）随机选图发到同群；尽量不与上一张重复；无图或失败时静默跳过。发图需飞书 **用户身份** 下 IM 资源相关权限，并建议 `lark-cli auth login --scope "im:resource im:resource:upload"`（以你控制台实际 scope 为准）。
 - **写作批改**：`#写作提交` 触发 Gemini 四维评分（TR / CC / LR / GRA）与建议；失败时引导手动 `#批改结果` 回填。
@@ -55,8 +55,8 @@
 
 | 脚本                                | 作用                                          |
 | --------------------------------- | ------------------------------------------- |
-| `bin/send-daily-modes.sh`         | 08:30：未初始化先发模拟卷/提醒或已初始化发模式选择 + Day 进度条正文 |
-| `bin/init_placement_test.py`     | 首次未初始化时连发 6 条模拟卷正文并置 `mock_test_sent`        |
+| `bin/send-daily-modes.sh`         | 08:30：未初始化先发模拟卷/提醒或已初始化发模式选择 + Day 进度条正文    |
+| `bin/init_placement_test.py`      | 首次未初始化时连发 6 条模拟卷正文并置 `mock_test_sent`       |
 | `bin/message-router.py`           | 拉取会话消息，路由写作/初始化/打卡/模式等并写状态                  |
 | `bin/parse-checkin.py`            | 可选：只处理会话**最新一条**打卡（与 router 二选一或并存时注意幂等）    |
 | `bin/weekly-report.py`            | 生成并发送周日周报                                   |
@@ -102,7 +102,7 @@
 **LaunchAgent**：
 
 - 每日 08:30、消息路由等：通常放在 `~/Library/LaunchAgents/`，由你自行配置指向本仓库脚本（示例名如 `com.youngkit.ielts-daily-push.plist`）。
-- **周报示例**：仓库内 [`launchd/com.youngkit.ielts-weekly-report.plist`](launchd/com.youngkit.ielts-weekly-report.plist)（周日 21:00，需把其中路径与 `FEISHU_IELTS_CHAT_ID` 改成你的环境）。
+- **周报示例**：仓库内 `[launchd/com.youngkit.ielts-weekly-report.plist](launchd/com.youngkit.ielts-weekly-report.plist)`（周日 21:00，需把其中路径与 `FEISHU_IELTS_CHAT_ID` 改成你的环境）。
 
 加载示例：
 
@@ -144,7 +144,7 @@ launchctl enable "gui/$(id -u)/com.youngkit.ielts-daily-push"
 
 A **Feishu (Lark) CLI**–based local bot for IELTS study supervision: scheduled pushes (08:30) with a **six-part academic mock exam** on first-time setup, then **mode selection** (1/2/3) with **Day x/N** progress aligned to structured check-in days, mode-aware **staged** tasks with **Cambridge IELTS 10–18**-style progress, **structured check-in** (plus legacy `打卡 x/y`), state (🟢 / 🟡 / 🔴) with **Recovery Mode**, optional **missed-check-in** notice before the morning push, **random post–check-in image** from `pictures/`, Gemini writing review (TR/CC/LR/GRA), initialization placement with an **N-day** study roadmap (AI with rule fallback), and a **Sunday weekly report** (rule-based commentary).
 
-See [`飞书文档/PRD.md`](飞书文档/PRD.md) for the full PRD (Chinese).
+See `[飞书文档/PRD.md](飞书文档/PRD.md)` for the full PRD (Chinese).
 
 ### Architecture (ASCII)
 
